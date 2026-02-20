@@ -1,0 +1,43 @@
+name: "YouTube Monitoring"
+version: "1.4.18"
+slug: "youtube_monitoring"
+description: "YouTube 쿠키만으로 시청 기록을 일별/월별 조회하는 독립형 에드온."
+url: "http://homeassistant.local:8765"
+icon: "icon.png"
+logo: "logo.png"
+panel_icon: "mdi:youtube-subscription"
+panel_title: "YouTube 시청 기록"
+arch:
+  - armhf
+  - armv7
+  - aarch64
+  - amd64
+  - i386
+startup: application
+boot: auto
+ports:
+  8765/tcp: 8765
+ports_description:
+  8765/tcp: "YouTube History API 웹 서버"
+ingress: true
+ingress_port: 8765
+webui: "http://[HOST]:[PORT:8765]"
+map:
+  - config:rw
+  - share:rw
+options:
+  cookies_path: "/config/youtube_cookies.txt"
+  scan_interval: 60
+  port: 8765
+  duplicate_minutes: 5
+  fetch_recommended: true
+  scan_interval_recommended: 1800
+  timezone: "Asia/Seoul"
+schema:
+  cookies_path: "str"
+  scan_interval: "int(30,300)?"
+  port: "int(1024,65535)?"
+  duplicate_minutes: "int(1,60)?"
+  fetch_recommended: "bool?"
+  scan_interval_recommended: "int(60,3600)?"
+  timezone: "str?"
