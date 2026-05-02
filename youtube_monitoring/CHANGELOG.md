@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.5.1] - 2026-05-02
+
+### MQTT 최근 시청 영상 센서 추가
+- `sensor.youtube_recent_watched`
+  - state: 가장 최근 시청한 영상 제목
+  - attributes: video_id / channel / url / thumbnail / duration / observed_at
+  - attributes.recent_videos: 최근 5개 영상 리스트 (자동화·카드 활용)
+- 새 영상 시청 감지 시 즉시 MQTT 발행 (state_changed 트리거 가능)
+- 시작 시점에도 1회 발행
+
 ## [1.5.0] - 2026-05-02
 
 ### 쿠키 상태 검출 로직 개선

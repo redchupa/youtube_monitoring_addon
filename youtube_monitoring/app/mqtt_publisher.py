@@ -2,6 +2,7 @@
 Home Assistant MQTT Discovery 퍼블리셔.
 
 - 추천 영상 3개 → 각 sensor.youtube_recommended_1/2/3
+- 최근 시청 영상 → sensor.youtube_recent_watched (state=제목, attrs=영상정보+최근5개)
 - 쿠키 유효성 → binary_sensor.youtube_cookies_valid (connectivity)
 - HA Supervisor에서 MQTT 서비스 정보를 받아 자동 연결.
 
@@ -12,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any
 
 try:
@@ -184,6 +186,20 @@ class MqttPublisher:
             cfg_count, retain=True,
         )
 
+        # 최근 시청 영상 sensor (state=가장 최근 영상 제목, attrs=상세 + 최근 5개)
+        cfg_recent = {
+            "name": "YouTube 최근 시청 영상",
+            "unique_id": "youtube_recent_watched",
+            "state_topic": f"{NODE_ID}/recent_watched/state",
+            "json_attributes_topic": f"{NODE_ID}/recent_watched/attributes",
+            "icon": "mdi:youtube-tv",
+            "device": _DEVICE,
+        }
+        self._publish(
+            f"{DISCOVERY_PREFIX}/sensor/{NODE_ID}/recent_watched/config",
+            cfg_recent, retain=True,
+        )
+
     def publish_recommended(self, videos: list[dict]) -> None:
         """추천 영상 3개를 sensor 상태/속성으로 발행."""
         videos = videos or []
@@ -211,3 +227,52 @@ class MqttPublisher:
 
     def publish_cookies_valid(self, valid: bool) -> None:
         self._publish(f"{NODE_ID}/cookies_valid/state", "ON" if valid else "OFF")
+
+    def publish_recent_watched(self, videos: list[dict]) -> None:
+        """최근 시청 영상 발행.
+
+        - state: 가장 최근 영상 제목 (None이면 빈 문자열)
+        - attributes:
+            - video_id, title, channel, url, thumbnail, duration (가장 최근 영상)
+            - watched_at (저장 시각)
+            - recent_videos: 최근 5개 영상 리스트 (자동화/카드 활용)
+        """
+        videos = videos or []
+        state_topic = f"{NODE_ID}/recent_watched/state"
+        attr_topic = f"{NODE_ID}/recent_watched/attributes"
+
+        if not videos:
+            self._publish(state_topic, "")
+            self._publish(attr_topic, {"recent_videos": []})
+            return
+
+        latest = videos[0]
+        title = (latest.get("title") or "")[:255]
+        self._publish(state_topic, title)
+
+        # 최근 5개를 attributes에 포함
+        recent_list = []
+        for v in videos[:5]:
+            recent_list.append({
+                "video_id": v.get("video_id", ""),
+                "title": v.get("title", ""),
+                "channel": v.get("channel", ""),
+                "url": v.get("url", ""),
+                "thumbnail": v.get("thumbnail", ""),
+                "duration": v.get("duration", ""),
+            })
+
+        # YouTube history 페이지에는 정확한 시청 시각이 없음.
+        # 이 영상이 "가장 최근"으로 인식된 시점(=관찰 시각)을 기록.
+        observed_at = datetime.now(timezone.utc).isoformat()
+
+        self._publish(attr_topic, {
+            "video_id": latest.get("video_id", ""),
+            "title": latest.get("title", ""),
+            "channel": latest.get("channel", ""),
+            "url": latest.get("url", ""),
+            "thumbnail": latest.get("thumbnail", ""),
+            "duration": latest.get("duration", ""),
+            "observed_at": observed_at,
+            "recent_videos": recent_list,
+        })

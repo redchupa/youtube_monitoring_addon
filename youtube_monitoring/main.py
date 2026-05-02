@@ -246,6 +246,9 @@ def fetch_loop() -> None:
                             if on_video_change(most_recent):
                                 _recent_added[video_id] = now
                         _last_seen_video_id = video_id
+                        # 최근 시청 영상 변경 → MQTT 발행
+                        if mqtt_pub and mqtt_pub.is_connected():
+                            mqtt_pub.publish_recent_watched(videos)
                     _recent_added = {k: v for k, v in _recent_added.items() if now - v < duplicate_sec * 2}
 
             if not fetcher.cookies_valid:
@@ -1004,6 +1007,7 @@ def main() -> None:
     if mqtt_pub and mqtt_pub.is_connected():
         mqtt_pub.publish_recommended(fetcher.recommended_data or [])
         mqtt_pub.publish_cookies_valid(fetcher.cookies_valid)
+        mqtt_pub.publish_recent_watched(fetcher.history_data or [])
         _last_published_cookies_valid = fetcher.cookies_valid
 
     _LOGGER.info("[%s] 백그라운드 갱신 스레드 시작 (interval=%ds)", "85%", interval)
