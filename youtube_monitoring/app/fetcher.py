@@ -25,6 +25,23 @@ _LOGGER = logging.getLogger(__name__)
 MAX_HISTORY_ITEMS = 20
 MAX_RECOMMENDED_ITEMS = 3
 
+# YouTube ytcfg에 LOGGED_IN 플래그가 매 응답마다 포함됨.
+# 만료된 쿠키일 경우 "LOGGED_IN":false 로 응답하므로 신뢰 가능한 지표.
+_LOGGED_IN_RE = re.compile(r'["\']LOGGED_IN["\']\s*:\s*(true|false)')
+
+
+def _check_html_logged_in(html: str) -> bool | None:
+    """YouTube HTML에서 로그인 상태 추출. None이면 판별 불가."""
+    if not html:
+        return None
+    m = _LOGGED_IN_RE.search(html)
+    if m:
+        return m.group(1) == "true"
+    # 보조 지표: DELEGATED_SESSION_ID 가 빈 값이면 비로그인
+    if '"DELEGATED_SESSION_ID":""' in html:
+        return False
+    return None
+
 
 def _parse_subscriber_count(text: str) -> int:
     """
@@ -296,6 +313,15 @@ class YouTubeHistoryFetcher:
             return []
 
         html = response.text
+        # 로그인 상태 직접 검사 (만료된 쿠키 즉시 감지)
+        logged_in = _check_html_logged_in(html)
+        if logged_in is not None:
+            if not logged_in and self.cookies_valid:
+                _LOGGER.warning("쿠키 만료 감지 | 로그인 안 된 상태로 응답 받음")
+            self.cookies_valid = logged_in
+            if not logged_in:
+                self.history_data = []
+                return []
 
         # ytInitialData JSON 추출 (두 가지 패턴 지원)
         match = re.search(r"var ytInitialData\s*=\s*({.*?});", html, re.DOTALL)
@@ -374,7 +400,11 @@ class YouTubeHistoryFetcher:
 
         history_list = lockups + video_renderers + shorts_list
         self.history_data = history_list[:MAX_HISTORY_ITEMS]
-        self.cookies_valid = True
+        # 로그인 마커가 명시적으로 발견된 경우에만 valid 갱신 (위에서 처리)
+        # 그렇지 않으면 데이터 존재 여부를 보조 지표로 사용
+        if history_list and not self.cookies_valid:
+            # 데이터는 있는데 마커가 명시 안 됨 → 일단 유효로 간주 (보수적)
+            self.cookies_valid = True
         return self.history_data
 
     def fetch_subscriptions(self) -> dict[str, Any] | None:
@@ -399,6 +429,14 @@ class YouTubeHistoryFetcher:
             return None
 
         html = response.text
+        logged_in = _check_html_logged_in(html)
+        if logged_in is not None:
+            if not logged_in and self.cookies_valid:
+                _LOGGER.warning("쿠키 만료 감지 | /feed/channels 비로그인 응답")
+            self.cookies_valid = logged_in
+            if not logged_in:
+                self.subscriptions_data = {"total_count": 0, "channels": []}
+                return self.subscriptions_data
         match = re.search(r"var ytInitialData\s*=\s*({.*?});", html, re.DOTALL)
         if not match:
             match = re.search(r"ytInitialData\s*=\s*({.*?});", html, re.DOTALL)
@@ -519,7 +557,9 @@ class YouTubeHistoryFetcher:
         channels.sort(key=_channel_sort_key)
 
         self.subscriptions_data = {"total_count": len(channels), "channels": channels}
-        if channels:
+        # cookies_valid는 위 LOGGED_IN 마커에서 이미 갱신됨.
+        # 마커가 없는 경우 채널 데이터 존재로 보조 판정.
+        if channels and not self.cookies_valid:
             self.cookies_valid = True
         return self.subscriptions_data
 
@@ -545,6 +585,14 @@ class YouTubeHistoryFetcher:
             return None
 
         html = response.text
+        logged_in = _check_html_logged_in(html)
+        if logged_in is not None:
+            if not logged_in and self.cookies_valid:
+                _LOGGER.warning("쿠키 만료 감지 | 메인 페이지 비로그인 응답 (개인화 추천 불가)")
+            self.cookies_valid = logged_in
+            if not logged_in:
+                self.recommended_data = []
+                return []
         match = re.search(r"var ytInitialData\s*=\s*({.*?});", html, re.DOTALL)
         if not match:
             match = re.search(r"ytInitialData\s*=\s*({.*?});\s*(?:var |$)", html, re.DOTALL)
@@ -562,7 +610,8 @@ class YouTubeHistoryFetcher:
 
         videos = self._parse_recommended_from_data(data)
         self.recommended_data = videos[:MAX_RECOMMENDED_ITEMS]
-        if videos:
+        # cookies_valid는 위 LOGGED_IN 마커에서 이미 갱신됨.
+        if videos and not self.cookies_valid:
             self.cookies_valid = True
         return self.recommended_data
 

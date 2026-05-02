@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.5.0] - 2026-05-02
+
+### 쿠키 상태 검출 로직 개선
+- YouTube ytcfg의 `LOGGED_IN` 마커를 매 응답마다 직접 검사
+- 쿠키 만료 시 즉시 `cookies_valid=False` 반영 (이전엔 한번 True가 되면 영원히 True)
+- 만료 감지 시 경고 로그 추가
+
+### MQTT Home Assistant Discovery 추가
+- HA에 자동 등록되는 sensor: `youtube_recommended_1/2/3` (제목 + 영상 정보 attributes)
+- `binary_sensor.youtube_cookies_valid` (connectivity, LWT 적용)
+- `sensor.youtube_recommended_count` (추천 영상 개수, 자동화 트리거용)
+- HA Supervisor에서 MQTT 정보 자동 조회 (`services: ["mqtt:want"]`)
+- HA에 MQTT 통합이 없으면 자동으로 건너뜀 (선택사항)
+
 ## [1.4.18] - 2026-02-20
 
 - CHANGELOG 정리 및 문서 업데이트

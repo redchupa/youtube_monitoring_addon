@@ -1,7 +1,7 @@
 # YouTube Monitoring Add-on
 FROM alpine:3.19
 
-RUN apk add --no-cache python3 py3-requests ca-certificates tzdata
+RUN apk add --no-cache python3 py3-requests py3-paho-mqtt ca-certificates tzdata
 
 WORKDIR /app
 

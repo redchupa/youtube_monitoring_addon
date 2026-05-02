@@ -1,7 +1,7 @@
 name: "YouTube Monitoring"
-version: "1.4.18"
+version: "1.5.0"
 slug: "youtube_monitoring"
-description: "YouTube 쿠키만으로 시청 기록을 일별/월별 조회하는 독립형 에드온."
+description: "YouTube 쿠키 기반 시청 기록·구독·추천 영상 조회 + MQTT Discovery 센서."
 url: "http://homeassistant.local:8765"
 icon: "icon.png"
 logo: "logo.png"
@@ -25,6 +25,8 @@ webui: "http://[HOST]:[PORT:8765]"
 map:
   - config:rw
   - share:rw
+services:
+  - "mqtt:want"
 options:
   cookies_path: "/config/youtube_cookies.txt"
   scan_interval: 60
