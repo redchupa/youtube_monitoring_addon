@@ -1,5 +1,5 @@
 name: "YouTube Monitoring"
-version: "1.5.1"
+version: "1.5.2"
 slug: "youtube_monitoring"
 description: "YouTube 쿠키 기반 시청 기록·구독·추천 영상 조회 + MQTT Discovery 센서."
 url: "http://homeassistant.local:8765"

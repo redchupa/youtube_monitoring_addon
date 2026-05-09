@@ -32,8 +32,9 @@ NODE_ID = "youtube_monitoring"
 _DEVICE = {
     "identifiers": [NODE_ID],
     "name": "YouTube Monitoring",
-    "manufacturer": "redchupa",
-    "model": "YouTube Monitoring Add-on",
+    "manufacturer": "우*만",
+    "model": "토스 1000-1261-7813",
+    "sw_version": "커피 한잔은 사랑입니다",
 }
 
 
