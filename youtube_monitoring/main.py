@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from app.cookie_manager import CookieFileError
 from app.fetcher import YouTubeHistoryFetcher
 from app.history_store import (
     load_history,
@@ -87,6 +88,18 @@ _last_published_cookies_valid: bool | None = None  # MQTT 중복 발행 방지
 
 REFRESH_COOLDOWN_SEC = 600  # 수동 새로고침 쿨다운 10분
 
+# 쿠키 자동 유지
+COOKIE_ROTATE_INTERVAL = 600  # 정상일 때 약 10분마다 쿠키 회전 (브라우저와 비슷한 주기)
+COOKIE_RECOVERY_RETRY_SEC = 1800  # 만료 상태에서 자동 복구 재시도 간격
+COOKIE_NOTIFICATION_ID = "youtube_monitoring_cookie"
+INGRESS_PROXY_IP = "172.30.32.2"  # HA Supervisor Ingress 프록시 주소
+MAX_COOKIE_UPLOAD_BYTES = 1_000_000
+
+_cookie_invalid_since: float | None = None
+_last_cookie_recovery: float = 0
+_cookie_notified = False
+_cookie_state_lock = threading.Lock()
+
 
 def _parse_bool(val: Any) -> bool:
     """옵션 값을 bool로 변환."""
@@ -108,6 +121,7 @@ def load_options() -> dict:
         "fetch_recommended": _parse_bool(os.environ.get("FETCH_RECOMMENDED", "true")),
         "scan_interval_recommended": int(os.environ.get("SCAN_INTERVAL_RECOMMENDED", "1800")),
         "timezone": os.environ.get("TZ", "Asia/Seoul"),
+        "notify_cookie_invalid": _parse_bool(os.environ.get("NOTIFY_COOKIE_INVALID", "true")),
     }
     try:
         if os.path.exists(options_path):
@@ -118,6 +132,8 @@ def load_options() -> dict:
                 defaults["fetch_recommended"] = _parse_bool(opts["fetch_recommended"])
             if "scan_interval_recommended" in opts:
                 defaults["scan_interval_recommended"] = int(opts["scan_interval_recommended"])
+            if "notify_cookie_invalid" in opts:
+                defaults["notify_cookie_invalid"] = _parse_bool(opts["notify_cookie_invalid"])
     except (json.JSONDecodeError, OSError) as err:
         _LOGGER.warning("Failed to load options.json: %s, using env defaults", err)
 
@@ -187,6 +203,114 @@ def on_video_change(video_data: dict) -> bool:
         return True
 
 
+def _ha_service(service: str, data: dict) -> bool:
+    """Supervisor 경유 HA 서비스 호출 (persistent_notification 등). HA 밖에서는 False."""
+    token = os.environ.get("SUPERVISOR_TOKEN")
+    if not token:
+        return False
+    try:
+        import requests  # 지연 import (fetcher와 동일 의존성)
+
+        r = requests.post(
+            f"http://supervisor/core/api/services/{service}",
+            headers={"Authorization": f"Bearer {token}"},
+            json=data,
+            timeout=10,
+        )
+        if r.status_code >= 300:
+            _LOGGER.warning("[알림] HA 서비스 %s 실패: HTTP %s", service, r.status_code)
+            return False
+        return True
+    except Exception as err:
+        _LOGGER.warning("[알림] HA 서비스 %s 호출 오류: %s", service, err)
+        return False
+
+
+def _notify_cookie_invalid(problem: str) -> None:
+    if not load_options().get("notify_cookie_invalid", True):
+        return
+    if problem == "missing":
+        reason = "쿠키 파일이 없거나 읽을 수 없습니다."
+    else:
+        reason = "YouTube 로그인 세션이 만료됐고, 자동 갱신으로 복구하지 못했습니다."
+    _ha_service("persistent_notification/create", {
+        "notification_id": COOKIE_NOTIFICATION_ID,
+        "title": "YouTube Monitoring: 쿠키 갱신 필요",
+        "message": (
+            f"{reason}\n\n"
+            "에드온 웹 UI(YouTube 시청 기록 패널)의 **쿠키 업데이트** 버튼으로 새 쿠키를 넣어 주세요.\n\n"
+            "오래 유지되게 하려면: 브라우저 **시크릿 창**에서 YouTube 로그인 → "
+            "'Get cookies.txt LOCALLY'로 내보내기 → **시크릿 창을 바로 닫기**."
+        ),
+    })
+
+
+def _dismiss_cookie_notification() -> None:
+    _ha_service("persistent_notification/dismiss", {"notification_id": COOKIE_NOTIFICATION_ID})
+
+
+def _reset_cookie_state() -> None:
+    """쿠키가 다시 유효해졌을 때 상태/알림 정리."""
+    global _cookie_invalid_since, _cookie_notified, _last_cookie_recovery
+    with _cookie_state_lock:
+        was_invalid = _cookie_invalid_since is not None
+        notified = _cookie_notified
+        _cookie_invalid_since = None
+        _cookie_notified = False
+        _last_cookie_recovery = 0
+    if was_invalid:
+        _LOGGER.info("[쿠키] 다시 유효함")
+    if notified:
+        _dismiss_cookie_notification()
+
+
+def maintain_cookies() -> None:
+    """
+    쿠키 자동 유지 (fetch_history 직후 호출).
+    - 유효: 약 10분마다 Google 쿠키 회전 → 새 쿠키를 파일에 저장 (브라우저처럼 세션 유지).
+    - 만료: 회전으로 복구를 시도하고 다시 조회. 그래도 실패하면 HA 알림 1회.
+    """
+    global _cookie_invalid_since, _last_cookie_recovery, _cookie_notified
+    if not fetcher:
+        return
+    now = time.time()
+
+    if fetcher.cookies_valid:
+        if _cookie_invalid_since is not None or _cookie_notified:
+            _reset_cookie_state()
+        if now - fetcher.cookies.last_rotate_at >= COOKIE_ROTATE_INTERVAL:
+            fetcher.rotate_cookies()
+        return
+
+    problem = fetcher.cookie_problem()
+    if problem is None:
+        return  # 네트워크 오류 등 판단 불가 → 다음 루프에서 다시 확인
+    with _cookie_state_lock:
+        if _cookie_invalid_since is None:
+            _cookie_invalid_since = now
+        try_recovery = problem == "logged_out" and now - _last_cookie_recovery >= COOKIE_RECOVERY_RETRY_SEC
+        if try_recovery:
+            _last_cookie_recovery = now
+
+    if try_recovery:
+        _LOGGER.info("[쿠키] 만료 감지 → 자동 갱신으로 복구 시도")
+        result = fetcher.rotate_cookies(force=True)
+        if result is not False:
+            time.sleep(2)
+            fetcher.fetch_history()
+            if fetcher.cookies_valid:
+                _LOGGER.info("[쿠키] 자동 복구 성공")
+                _reset_cookie_state()
+                return
+        _LOGGER.warning("[쿠키] 자동 복구 실패 | 웹 UI의 '쿠키 업데이트'로 새 쿠키를 넣어 주세요")
+
+    with _cookie_state_lock:
+        should_notify = not _cookie_notified
+        _cookie_notified = True
+    if should_notify:
+        _notify_cookie_invalid(problem)
+
+
 def fetch_loop() -> None:
     """
     백그라운드 루프: YouTube 시청 기록 폴링 + video_id 변경 시 저장.
@@ -209,6 +333,10 @@ def fetch_loop() -> None:
             now = time.time()
             fetcher.fetch_history()
             time.sleep(2)  # 요청 간 2초 대기 (429 방지)
+            try:
+                maintain_cookies()
+            except Exception as err:
+                _LOGGER.error("[쿠키] 자동 유지 오류: %s", err)
 
             if now - _last_subscriptions_fetch >= subscriptions_interval:
                 fetcher.fetch_subscriptions()
@@ -252,7 +380,7 @@ def fetch_loop() -> None:
                     _recent_added = {k: v for k, v in _recent_added.items() if now - v < duplicate_sec * 2}
 
             if not fetcher.cookies_valid:
-                _LOGGER.warning("[폴링] 쿠키 무효 | 시청 기록/구독 조회 불가, 쿠키 파일 갱신 필요")
+                _LOGGER.warning("[폴링] 쿠키 무효 | 시청 기록/구독 조회 불가 (자동 복구 실패 시 웹 UI '쿠키 업데이트' 사용)")
             else:
                 _LOGGER.debug("[폴링] 시청 기록 %d건 조회", len(videos))
         except Exception as err:
@@ -299,8 +427,74 @@ class YouTubeMonitoringHandler(BaseHTTPRequestHandler):
         if path == "/api/refresh/recommended":
             self._handle_refresh_recommended()
             return
+        if path == "/api/cookies":
+            self._handle_cookie_upload()
+            return
         self.send_response(404)
         self.end_headers()
+
+    def _is_trusted_request(self) -> bool:
+        """쿠키 교체는 HA Ingress(로그인된 HA 사용자) 경유만 허용. HA 밖(로컬 실행)은 허용."""
+        if not os.environ.get("SUPERVISOR_TOKEN"):
+            return True
+        return self.client_address[0] == INGRESS_PROXY_IP
+
+    def _handle_cookie_upload(self) -> None:
+        """웹 UI에서 붙여넣은/선택한 cookies.txt로 쿠키 교체 → 즉시 검증."""
+        global fetcher
+        if not self._is_trusted_request():
+            self.send_json({"error": "forbidden", "message": "HA 웹 UI(Ingress)에서만 쿠키를 바꿀 수 있습니다."}, status=403)
+            return
+        if not fetcher:
+            self.send_json({"error": "fetcher not ready"}, status=503)
+            return
+        try:
+            content_len = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            content_len = 0
+        if content_len <= 0 or content_len > MAX_COOKIE_UPLOAD_BYTES:
+            self.send_json({"error": "invalid_size", "message": "쿠키 내용이 비었거나 너무 큽니다 (최대 1MB)."}, status=400)
+            return
+        raw = self.rfile.read(content_len)
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            self.send_json({"error": "invalid_encoding", "message": "UTF-8 텍스트 파일이 아닙니다."}, status=400)
+            return
+        if "json" in (self.headers.get("Content-Type") or ""):
+            try:
+                text = str(json.loads(text).get("cookies", ""))
+            except (json.JSONDecodeError, AttributeError):
+                self.send_json({"error": "invalid_json"}, status=400)
+                return
+        try:
+            count = fetcher.cookies.replace_from_text(text)
+        except CookieFileError as err:
+            self.send_json({"error": "invalid_cookies", "message": str(err)}, status=400)
+            return
+        except OSError as err:
+            _LOGGER.error("[쿠키] 저장 실패: %s", err)
+            self.send_json({"error": "save_failed", "message": f"쿠키 파일 저장 실패: {err}"}, status=500)
+            return
+
+        _LOGGER.info("[쿠키] 웹 UI에서 새 쿠키 등록 (%d개) → 검증 중", count)
+        fetcher.logged_out_detected = False
+        fetcher.cookies_valid = False
+        fetcher.fetch_history()
+        if fetcher.cookies_valid:
+            _reset_cookie_state()
+            fetcher.rotate_cookies(force=True)
+            message = "새 쿠키가 적용됐습니다. 이제 자동으로 갱신됩니다."
+        elif fetcher.logged_out_detected:
+            message = "쿠키는 저장됐지만 YouTube가 로그아웃 상태로 응답합니다. 로그인한 상태에서 다시 내보내 주세요."
+        else:
+            message = "쿠키는 저장됐지만 아직 확인하지 못했습니다. 잠시 후 상태를 확인해 주세요."
+        self.send_json({
+            "status": "ok",
+            "cookie_count": count,
+            "cookies_valid": fetcher.cookies_valid,
+            "message": message,
+        })
 
     def _handle_ingest(self) -> None:
         """실시간 video_id 수신 → yt_history.json에 즉시 저장."""
@@ -390,6 +584,8 @@ class YouTubeMonitoringHandler(BaseHTTPRequestHandler):
             self.send_json({
                 "status": "ok",
                 "cookies_valid": fetcher.cookies_valid if fetcher else False,
+                "cookie_problem": fetcher.cookie_problem() if fetcher else "missing",
+                "cookie_maintenance": fetcher.cookies.status() if fetcher else None,
             })
             return
         self.send_response(404)
@@ -419,6 +615,7 @@ class YouTubeMonitoringHandler(BaseHTTPRequestHandler):
 
         self.send_json({
             "cookies_valid": fetcher.cookies_valid if fetcher else False,
+            "cookie_maintenance": fetcher.cookies.status() if fetcher else None,
             "by_date": by_date,
             "monthly_stats": monthly,
             "monthly_breakdown": monthly_breakdown,
@@ -518,6 +715,21 @@ def _get_ui_html() -> str:
         .calendar-day.has-count:hover { background: #2a2a2a; }
         .calendar-day-detail { margin-top: 20px; padding-top: 16px; border-top: 1px solid #333; }
         .calendar-day-detail h4 { margin: 0 0 12px 0; font-size: 0.95rem; color: var(--ha-text-secondary); }
+        .cookie-btn { margin-left: 8px; padding: 6px 12px; border-radius: 20px; border: 1px solid #444; background: transparent; color: var(--ha-text-secondary); font-size: 0.8rem; cursor: pointer; }
+        .cookie-btn:hover { background: #2a2a2a; color: var(--ha-text); }
+        .cookie-btn.attention { border-color: #f44336; color: #f44336; }
+        .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: none; align-items: center; justify-content: center; z-index: 100; padding: 16px; }
+        .modal-backdrop.open { display: flex; }
+        .modal { background: var(--ha-card); border-radius: 12px; padding: 20px; width: 100%; max-width: 560px; max-height: 90vh; overflow-y: auto; }
+        .modal h3 { margin: 0 0 8px 0; font-size: 1.1rem; }
+        .modal ol { margin: 8px 0 12px 0; padding-left: 20px; font-size: 0.85rem; color: var(--ha-text-secondary); line-height: 1.6; }
+        .modal textarea { width: 100%; min-height: 140px; box-sizing: border-box; background: #111; color: var(--ha-text); border: 1px solid #444; border-radius: 8px; padding: 8px; font-family: monospace; font-size: 0.75rem; }
+        .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px; flex-wrap: wrap; align-items: center; }
+        .modal-actions input[type=file] { margin-right: auto; font-size: 0.8rem; color: var(--ha-text-secondary); max-width: 100%; }
+        .modal-msg { margin-top: 10px; font-size: 0.85rem; min-height: 1.2em; }
+        .modal-msg.ok { color: #4caf50; }
+        .modal-msg.err { color: #f44336; }
+        .modal-meta { font-size: 0.75rem; color: var(--ha-text-secondary); margin-top: 8px; }
     </style>
 </head>
 <body>
@@ -525,7 +737,28 @@ def _get_ui_html() -> str:
         <h1 style="display:flex; align-items:center; flex-wrap:wrap;">
             <span class="icon">▶</span> YouTube 시청 기록
             <span id="cookie-status" class="cookie-status loading">확인 중...</span>
+            <button id="btn-cookie-update" class="cookie-btn" type="button">쿠키 업데이트</button>
         </h1>
+        <div id="cookie-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="cookie-modal-title">
+            <div class="modal">
+                <h3 id="cookie-modal-title">YouTube 쿠키 업데이트</h3>
+                <div style="font-size:0.85rem; color:var(--ha-text-secondary);">한 번 넣으면 에드온이 약 10분마다 스스로 갱신합니다. 오래 유지하려면 아래 순서를 지켜 주세요.</div>
+                <ol>
+                    <li>브라우저 <b>시크릿 창</b>을 열고 YouTube에 로그인</li>
+                    <li>확장 프로그램 <b>Get cookies.txt LOCALLY</b>로 youtube.com 쿠키 내보내기</li>
+                    <li><b>시크릿 창을 바로 닫기</b> (같은 세션을 브라우저가 계속 쓰면 쿠키가 빨리 무효화됩니다)</li>
+                    <li>파일을 선택하거나 내용을 아래에 붙여넣고 저장</li>
+                </ol>
+                <textarea id="cookie-text" placeholder="# Netscape HTTP Cookie File&#10;.youtube.com	TRUE	/	TRUE	..." spellcheck="false" autocomplete="off"></textarea>
+                <div class="modal-actions">
+                    <input type="file" id="cookie-file" accept=".txt,text/plain">
+                    <button id="btn-cookie-cancel" class="tab" type="button">닫기</button>
+                    <button id="btn-cookie-save" class="tab active" type="button">저장 및 확인</button>
+                </div>
+                <div id="cookie-msg" class="modal-msg"></div>
+                <div id="cookie-meta" class="modal-meta"></div>
+            </div>
+        </div>
         <div class="tabs">
             <button class="tab active" data-tab="daily">일별 기록</button>
             <button class="tab" data-tab="monthly">월별 통계</button>
@@ -603,6 +836,8 @@ def _get_ui_html() -> str:
             const el = document.getElementById('cookie-status');
             if (!el) return;
             const valid = historyData.cookies_valid;
+            const btn = document.getElementById('btn-cookie-update');
+            if (btn) btn.classList.toggle('attention', valid === false);
             if (valid === true) {
                 el.className = 'cookie-status connected';
                 el.textContent = '쿠키 연결됨';
@@ -622,7 +857,7 @@ def _get_ui_html() -> str:
 
             if (historyData.cookies_valid === false && dates.length === 0) {
                 status.className = 'status error';
-                status.textContent = '쿠키가 유효하지 않습니다. /config/youtube_cookies.txt 파일을 확인하세요.';
+                status.textContent = '쿠키가 유효하지 않습니다. 오른쪽 위 [쿠키 업데이트] 버튼으로 새 쿠키를 넣어 주세요.';
             } else {
                 status.className = 'status ok';
                 status.textContent = dates.length ? dates.length + '일치 기록 (' + dates.reduce((s,d) => s + (historyData.by_date[d]?.length||0), 0) + '개 영상)' : '기록이 없습니다. YouTube 시청 후 잠시 기다려 주세요.';
@@ -936,6 +1171,85 @@ def _get_ui_html() -> str:
             if (el) el.innerHTML = '<div class="empty">새로고침 중...</div>';
             await load();
         });
+        function apiBase() {
+            return window.location.pathname.endsWith('/') ? window.location.pathname : window.location.pathname + '/';
+        }
+
+        function renderCookieMeta() {
+            const el = document.getElementById('cookie-meta');
+            const m = historyData.cookie_maintenance;
+            if (!el || !m) return;
+            const fmt = ts => ts ? new Date(ts * 1000).toLocaleString('ko-KR') : '-';
+            const ok = m.last_rotate_ok === true ? '성공' : (m.last_rotate_ok === false ? '거부됨' : '-');
+            el.textContent = '마지막 자동 갱신: ' + fmt(m.last_rotate_at) + ' (' + ok + ') · 마지막 저장: ' + fmt(m.last_saved_at);
+        }
+
+        function openCookieModal() {
+            document.getElementById('cookie-msg').textContent = '';
+            document.getElementById('cookie-msg').className = 'modal-msg';
+            renderCookieMeta();
+            document.getElementById('cookie-modal').classList.add('open');
+        }
+
+        function closeCookieModal() {
+            document.getElementById('cookie-modal').classList.remove('open');
+            document.getElementById('cookie-text').value = '';
+            document.getElementById('cookie-file').value = '';
+        }
+
+        async function saveCookies() {
+            const msg = document.getElementById('cookie-msg');
+            const btn = document.getElementById('btn-cookie-save');
+            const text = document.getElementById('cookie-text').value;
+            if (!text.trim()) {
+                msg.className = 'modal-msg err';
+                msg.textContent = '쿠키 파일을 선택하거나 내용을 붙여넣어 주세요.';
+                return;
+            }
+            btn.disabled = true;
+            msg.className = 'modal-msg';
+            msg.textContent = '저장 후 YouTube 로그인 상태를 확인하는 중... (최대 20초)';
+            try {
+                const r = await fetch(apiBase() + 'api/cookies', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+                    body: text,
+                });
+                const data = await r.json().catch(() => ({}));
+                if (!r.ok) {
+                    msg.className = 'modal-msg err';
+                    msg.textContent = data.message || ('저장 실패 (HTTP ' + r.status + ')');
+                    return;
+                }
+                msg.className = 'modal-msg ' + (data.cookies_valid ? 'ok' : 'err');
+                msg.textContent = data.message + ' (' + data.cookie_count + '개 쿠키)';
+                document.getElementById('cookie-text').value = '';
+                document.getElementById('cookie-file').value = '';
+                await load();
+                renderCookieMeta();
+            } catch (e) {
+                msg.className = 'modal-msg err';
+                msg.textContent = '오류: ' + e.message;
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        document.getElementById('btn-cookie-update').addEventListener('click', openCookieModal);
+        document.getElementById('cookie-status').addEventListener('click', openCookieModal);
+        document.getElementById('cookie-status').style.cursor = 'pointer';
+        document.getElementById('btn-cookie-cancel').addEventListener('click', closeCookieModal);
+        document.getElementById('btn-cookie-save').addEventListener('click', saveCookies);
+        document.getElementById('cookie-modal').addEventListener('click', e => { if (e.target.id === 'cookie-modal') closeCookieModal(); });
+        document.addEventListener('keydown', e => { if (e.key === 'Escape') closeCookieModal(); });
+        document.getElementById('cookie-file').addEventListener('change', e => {
+            const f = e.target.files && e.target.files[0];
+            if (!f) return;
+            const reader = new FileReader();
+            reader.onload = () => { document.getElementById('cookie-text').value = reader.result || ''; };
+            reader.readAsText(f);
+        });
+
         load();
         setInterval(load, 60000);
         setInterval(updateRecommendedCooldown, 1000);

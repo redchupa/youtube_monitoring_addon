@@ -14,11 +14,12 @@ import json
 import logging
 import os
 import re
-from http.cookiejar import MozillaCookieJar
 from typing import Any
 from urllib.parse import unquote
 
 import requests
+
+from .cookie_manager import CookieManager
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -27,10 +28,10 @@ MAX_RECOMMENDED_ITEMS = 3
 
 # YouTube ytcfg에 LOGGED_IN 플래그가 매 응답마다 포함됨.
 # 만료된 쿠키일 경우 "LOGGED_IN":false 로 응답하므로 신뢰 가능한 지표.
-_LOGGED_IN_RE = re.compile(r'["\']LOGGED_IN["\']\s*:\s*(true|false)')
+_LOGGED_IN_RE = re.compile(r"""["']LOGGED_IN["']\s*:\s*(true|false)""")
 
 
-def _check_html_logged_in(html: str) -> bool | None:
+def detect_logged_in(html: str) -> bool | None:
     """YouTube HTML에서 로그인 상태 추출. None이면 판별 불가."""
     if not html:
         return None
@@ -41,6 +42,9 @@ def _check_html_logged_in(html: str) -> bool | None:
     if '"DELEGATED_SESSION_ID":""' in html:
         return False
     return None
+
+
+_check_html_logged_in = detect_logged_in  # 이전 이름 호환
 
 
 def _parse_subscriber_count(text: str) -> int:
@@ -79,45 +83,58 @@ class YouTubeHistoryFetcher:
 
     def __init__(self, cookies_path: str) -> None:
         self.cookies_path = cookies_path
+        self.cookies = CookieManager(cookies_path)
         self.cookies_valid = False
+        self.logged_out_detected = False  # YouTube가 로그아웃 상태로 응답했는지
         self.history_data: list[dict[str, Any]] = []
         self.subscriptions_data: dict[str, Any] | None = None  # {total_count, channels: [{channel_name}]}
         self.recommended_data: list[dict[str, Any]] | None = None  # 최대 3개 추천 영상
 
     def _get_session(self) -> requests.Session | None:
-        """Netscape 형식 쿠키 파일로 세션 생성."""
-        if not os.path.exists(self.cookies_path):
-            _LOGGER.error("Cookies file not found: %s", self.cookies_path)
+        """쿠키 파일 기반 지속 세션 (응답 쿠키 자동 반영)."""
+        session = self.cookies.session()
+        if session is None:
             self.cookies_valid = False
-            return None
-
-        cookie_jar = MozillaCookieJar(self.cookies_path)
-        try:
-            cookie_jar.load(ignore_discard=True, ignore_expires=True)
-        except OSError as err:
-            _LOGGER.error("Failed to load cookies: %s", err)
-            self.cookies_valid = False
-            return None
-        except Exception as err:
-            _LOGGER.error("Unexpected cookie load error: %s", err)
-            self.cookies_valid = False
-            return None
-
-        if len(cookie_jar) == 0:
-            _LOGGER.error("Cookies file is empty")
-            self.cookies_valid = False
-            return None
-
-        session = requests.Session()
-        session.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-us,en;q=0.5",
-            "Sec-Fetch-Mode": "navigate",
-        }
-        session.cookies = cookie_jar
         return session
+
+    def _get(self, url: str) -> requests.Response | None:
+        """세션으로 GET → 갱신된 쿠키 저장. 세션이 없으면 None."""
+        with self.cookies.lock:
+            session = self._get_session()
+            if session is None:
+                return None
+            try:
+                return session.get(url, timeout=10)
+            finally:
+                try:
+                    self.cookies.save_if_changed()
+                except Exception as err:  # 저장 실패가 조회를 막지 않게
+                    _LOGGER.warning("[쿠키] 저장 실패: %s", err)
+
+    def _apply_login_state(self, html: str) -> bool | None:
+        """페이지의 LOGGED_IN 값으로 쿠키 유효성 갱신. 판단 불가 시 None."""
+        state = detect_logged_in(html)
+        if state is False:
+            if self.cookies_valid or not self.logged_out_detected:
+                _LOGGER.warning("[쿠키] YouTube가 로그아웃 상태로 응답 - 쿠키 만료")
+            self.cookies_valid = False
+            self.logged_out_detected = True
+        elif state is True:
+            self.cookies_valid = True
+            self.logged_out_detected = False
+        return state
+
+    def cookie_problem(self) -> str | None:
+        """확실한 쿠키 문제: 'missing'(파일 없음/깨짐), 'logged_out'(로그아웃 응답), 없으면 None."""
+        if self.cookies.session() is None:
+            return "missing"
+        if self.logged_out_detected:
+            return "logged_out"
+        return None
+
+    def rotate_cookies(self, force: bool = False) -> bool | None:
+        """Google 쿠키 회전(자동 갱신). CookieManager.rotate 참조."""
+        return self.cookies.rotate(force=force)
 
     def _get_best_thumbnail(self, video_id: str) -> str:
         """maxresdefault 있으면 사용, 없으면 0.jpg."""
@@ -295,13 +312,11 @@ class YouTubeHistoryFetcher:
         /feed/history 페이지 조회 → ytInitialData 파싱 → 영상 목록 반환.
         우선순위: lockup > videoRenderer > Shorts.
         """
-        session = self._get_session()
-        if session is None:
-            self.history_data = []
-            return []
-
         try:
-            response = session.get("https://www.youtube.com/feed/history", timeout=10)
+            response = self._get("https://www.youtube.com/feed/history")
+            if response is None:
+                self.history_data = []
+                return []
             if response.status_code == 429:
                 _LOGGER.warning("YouTube rate limit (429). scan_interval을 늘려주세요.")
                 self.history_data = []
@@ -313,15 +328,9 @@ class YouTubeHistoryFetcher:
             return []
 
         html = response.text
-        # 로그인 상태 직접 검사 (만료된 쿠키 즉시 감지)
-        logged_in = _check_html_logged_in(html)
-        if logged_in is not None:
-            if not logged_in and self.cookies_valid:
-                _LOGGER.warning("쿠키 만료 감지 | 로그인 안 된 상태로 응답 받음")
-            self.cookies_valid = logged_in
-            if not logged_in:
-                self.history_data = []
-                return []
+        if self._apply_login_state(html) is False:
+            self.history_data = []
+            return []
 
         # ytInitialData JSON 추출 (두 가지 패턴 지원)
         match = re.search(r"var ytInitialData\s*=\s*({.*?});", html, re.DOTALL)
@@ -412,13 +421,11 @@ class YouTubeHistoryFetcher:
         /feed/channels 페이지 조회 → 구독 채널 목록 반환.
         Returns: {total_count: int, channels: [{channel_name: str}, ...]} 또는 None
         """
-        session = self._get_session()
-        if session is None:
-            self.subscriptions_data = None
-            return None
-
         try:
-            response = session.get("https://www.youtube.com/feed/channels", timeout=10)
+            response = self._get("https://www.youtube.com/feed/channels")
+            if response is None:
+                self.subscriptions_data = None
+                return None
             if response.status_code == 429:
                 _LOGGER.warning("YouTube rate limit (429). scan_interval을 늘려주세요.")
                 return self.subscriptions_data  # 기존 데이터 유지
@@ -429,14 +436,8 @@ class YouTubeHistoryFetcher:
             return None
 
         html = response.text
-        logged_in = _check_html_logged_in(html)
-        if logged_in is not None:
-            if not logged_in and self.cookies_valid:
-                _LOGGER.warning("쿠키 만료 감지 | /feed/channels 비로그인 응답")
-            self.cookies_valid = logged_in
-            if not logged_in:
-                self.subscriptions_data = {"total_count": 0, "channels": []}
-                return self.subscriptions_data
+        if self._apply_login_state(html) is False:
+            return self.subscriptions_data  # 로그아웃: 기존 데이터 유지 (변경 이력 오염 방지)
         match = re.search(r"var ytInitialData\s*=\s*({.*?});", html, re.DOTALL)
         if not match:
             match = re.search(r"ytInitialData\s*=\s*({.*?});", html, re.DOTALL)
@@ -568,13 +569,11 @@ class YouTubeHistoryFetcher:
         YouTube 메인 페이지 조회 → 추천 영상 최대 3개 반환.
         여러 경로/구조 시도 (YouTube UI 변경 대응).
         """
-        session = self._get_session()
-        if session is None:
-            self.recommended_data = None
-            return None
-
         try:
-            response = session.get("https://www.youtube.com", timeout=10)
+            response = self._get("https://www.youtube.com")
+            if response is None:
+                self.recommended_data = None
+                return None
             if response.status_code == 429:
                 _LOGGER.warning("YouTube rate limit (429). scan_interval을 늘려주세요.")
                 return self.recommended_data or []
@@ -585,14 +584,9 @@ class YouTubeHistoryFetcher:
             return None
 
         html = response.text
-        logged_in = _check_html_logged_in(html)
-        if logged_in is not None:
-            if not logged_in and self.cookies_valid:
-                _LOGGER.warning("쿠키 만료 감지 | 메인 페이지 비로그인 응답 (개인화 추천 불가)")
-            self.cookies_valid = logged_in
-            if not logged_in:
-                self.recommended_data = []
-                return []
+        if self._apply_login_state(html) is False:
+            self.recommended_data = []  # 비로그인 추천은 개인화가 아니므로 비움 (MQTT 센서 포함)
+            return []
         match = re.search(r"var ytInitialData\s*=\s*({.*?});", html, re.DOTALL)
         if not match:
             match = re.search(r"ytInitialData\s*=\s*({.*?});\s*(?:var |$)", html, re.DOTALL)

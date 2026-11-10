@@ -1,7 +1,7 @@
 name: "YouTube Monitoring"
-version: "1.5.3"
+version: "1.5.4"
 slug: "youtube_monitoring"
-description: "YouTube 쿠키 기반 시청 기록·구독·추천 영상 조회 + MQTT Discovery 센서."
+description: "YouTube 쿠키 기반 시청 기록·구독·추천 영상 조회 + MQTT Discovery 센서 (쿠키 자동 갱신)."
 url: "http://homeassistant.local:8765"
 icon: "icon.png"
 logo: "logo.png"
@@ -20,6 +20,7 @@ ports:
   8765/tcp: 8765
 ports_description:
   8765/tcp: "YouTube History API 웹 서버"
+homeassistant_api: true
 ingress: true
 ingress_port: 8765
 webui: "http://[HOST]:[PORT:8765]"
@@ -36,6 +37,7 @@ options:
   fetch_recommended: true
   scan_interval_recommended: 1800
   timezone: "Asia/Seoul"
+  notify_cookie_invalid: true
 schema:
   cookies_path: "str"
   scan_interval: "int(30,300)?"
@@ -44,3 +46,4 @@ schema:
   fetch_recommended: "bool?"
   scan_interval_recommended: "int(60,3600)?"
   timezone: "str?"
+  notify_cookie_invalid: "bool?"

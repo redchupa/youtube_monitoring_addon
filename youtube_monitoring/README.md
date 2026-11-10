@@ -10,14 +10,15 @@ YouTube 쿠키만으로 시청 기록을 **일별/월별**로 조회하는 Home 
 - **구독 채널**: 썸네일, 구독자 수, @핸들, **이름순(한글→영어→특수문자) / 구독자 순** 정렬
 - 월별 구독 변경 (신규/취소 추적)
 - 추천 영상 (갱신 간격 설정 가능, 수동 새로고침 10분 쿨다운)
-- 웹 UI (쿠키 상태 표시), Ingress 지원
+- 웹 UI (쿠키 상태 표시, **쿠키 업데이트** 버튼), Ingress 지원
+- **쿠키 자동 갱신**: 응답 쿠키 저장 + 약 10분마다 Google 쿠키 회전, 만료 시 자동 복구 시도 후 HA 알림
 - 실시간 푸시 (`POST /api/ingest`, Shorts URL 스킵)
 
 ## 빠른 시작
 
 1. **설정** → **애드온** → YouTube Monitoring 설치
-2. 쿠키 파일 (`youtube_cookies.txt`)을 `/config`에 준비
-3. **웹 UI 열기**로 시청 기록 확인
+2. **웹 UI 열기** → 오른쪽 위 **쿠키 업데이트**에서 `youtube_cookies.txt` 등록 (시크릿 창에서 로그인 → 내보내기 → 창 닫기)
+3. 이후에는 에드온이 쿠키를 스스로 갱신합니다
 
 ## 설정
 
@@ -30,6 +31,7 @@ YouTube 쿠키만으로 시청 기록을 **일별/월별**로 조회하는 Home 
 | fetch_recommended | 추천 영상 조회 | true |
 | scan_interval_recommended | 추천 영상 갱신(초) | 1800 |
 | timezone | 로그·시청 기록 날짜용 타임존 | Asia/Seoul |
+| notify_cookie_invalid | 쿠키 만료·자동 복구 실패 시 HA 알림 | true |
 
 ## 문서
 

@@ -35,9 +35,25 @@
 ### 쿠키 준비
 
 1. Chrome 확장 **Get cookies.txt LOCALLY** 설치
-2. 시크릿 모드에서 YouTube 로그인
+2. 브라우저 **시크릿 창**에서 YouTube 로그인
 3. 쿠키 내보내기 → `youtube_cookies.txt`로 저장
-4. Home Assistant `/config` 폴더에 업로드
+4. **시크릿 창을 바로 닫기** (같은 로그인 세션을 브라우저가 계속 쓰면 쿠키가 빨리 무효화됩니다)
+5. 에드온 웹 UI 오른쪽 위 **쿠키 업데이트** 버튼 → 파일 선택(또는 붙여넣기) → **저장 및 확인**
+   - 예전처럼 `/config/youtube_cookies.txt`에 직접 올려도 됩니다. 파일이 바뀌면 자동으로 다시 읽습니다.
+
+### 쿠키 자동 갱신 (v1.5.4+)
+
+한 번 넣은 쿠키를 에드온이 브라우저처럼 스스로 유지합니다.
+
+- YouTube/Google이 응답으로 보내 주는 새 쿠키를 쿠키 파일에 자동 저장
+- 약 10분마다 Google 쿠키 회전(`accounts.youtube.com/RotateCookies`)으로 `__Secure-*PSIDTS` 갱신
+- YouTube가 로그아웃 상태로 응답하면 자동 복구(회전 후 재조회)를 먼저 시도하고, 실패하면 HA **알림**(persistent notification)으로 쿠키 업데이트를 요청. 새 쿠키가 들어와 정상화되면 알림은 자동으로 사라집니다
+- 로그아웃 응답에 섞여 오는 로그인 쿠키 삭제 요청은 저장하지 않음 (일시적 오류로 세션을 잃지 않도록)
+- 웹 UI로 쿠키를 바꾸면 기존 파일은 `youtube_cookies.txt.bak`으로 보관
+
+> 아이디/비밀번호 자동 로그인은 지원하지 않습니다. Google 로그인은 봇 탐지·CAPTCHA·2단계 인증 때문에 자동화가 사실상 불가능하고, 시도 자체가 계정 보안 경고나 잠금을 부를 수 있습니다. 비밀번호를 에드온에 저장하는 위험도 피합니다.
+>
+> 비밀번호 변경, 모든 기기에서 로그아웃, Google 보안 조치 등으로 세션이 끊기면 자동 갱신으로도 복구할 수 없습니다. 이때만 위 순서로 쿠키를 다시 넣어 주세요.
 
 ### 설정 옵션
 
@@ -50,6 +66,7 @@
 | fetch_recommended | bool | true | 추천 영상 조회 여부. 스마트폰 등과 충돌 시 false로 비활성화 |
 | scan_interval_recommended | int | 1800 | 추천 영상 갱신 간격(초), 60~3600. fetch_recommended가 true일 때만 적용 |
 | timezone | str | Asia/Seoul | 로그 타임스탬프 및 **시청 기록 저장 시 날짜** 기준 타임존 (예: Europe/Paris, America/New_York) |
+| notify_cookie_invalid | bool | true | 쿠키가 만료되고 자동 복구도 실패하면 HA 알림 표시 |
 
 ### Ingress
 
@@ -141,6 +158,36 @@
 ### GET /api/health
 
 상태 확인용 엔드포인트입니다.
+
+```json
+{
+  "status": "ok",
+  "cookies_valid": true,
+  "cookie_problem": null,
+  "cookie_maintenance": {
+    "cookies_file_exists": true,
+    "cookie_count": 18,
+    "last_rotate_at": 1762761600,
+    "last_rotate_ok": true,
+    "last_rotate_message": "ok (updated)",
+    "last_saved_at": 1762761600
+  }
+}
+```
+
+- `cookie_problem`: `null` | `"missing"`(파일 없음/깨짐) | `"logged_out"`(YouTube가 로그아웃으로 응답)
+
+### POST /api/cookies
+
+새 쿠키(Netscape `cookies.txt` 내용)로 교체하고 바로 로그인 상태를 확인합니다. 웹 UI의 **쿠키 업데이트** 버튼이 사용합니다.
+
+- 본문: `text/plain`(cookies.txt 내용) 또는 `application/json` `{"cookies": "..."}`, 최대 1MB
+- youtube.com / google.com 쿠키만 저장, 로그인 쿠키(SID 등)가 없으면 400
+- **HA Ingress(웹 UI) 경유 요청만 허용**합니다. 8765 포트로 직접 보내면 403 (HA 밖에서 로컬 실행할 때는 허용)
+
+```json
+{ "status": "ok", "cookie_count": 18, "cookies_valid": true, "message": "새 쿠키가 적용됐습니다. 이제 자동으로 갱신됩니다." }
+```
 
 ### POST /api/ingest
 
@@ -249,6 +296,12 @@ python main.py
 ### 429 rate limit
 
 YouTube가 요청을 제한할 때 발생합니다. **scan_interval**을 120초 이상으로 늘리세요. 스마트폰과 동시 접속 시 `fetch_recommended`를 false로 설정할 수 있습니다.
+
+### 쿠키가 자꾸 만료됨
+
+- 쿠키를 **시크릿 창**에서 내보낸 뒤 그 창을 닫았는지 확인하세요. 평소 쓰는 브라우저 창에서 내보내면 브라우저와 에드온이 같은 세션을 동시에 갱신하다가 무효화되기 쉽습니다.
+- `/api/health`의 `cookie_maintenance.last_rotate_ok`가 `false`면 Google이 세션을 거부한 것입니다. 쿠키를 새로 넣어 주세요.
+- 웹 UI의 **쿠키 업데이트** 창 아래에 마지막 자동 갱신/저장 시각이 표시됩니다.
 
 ### 쿠키 만료 후 데이터
 

@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.5.4] - 2026-11-10
+
+### 추가
+- **쿠키 자동 갱신**: YouTube/Google이 보내 주는 새 쿠키를 파일에 자동 저장하고, 약 10분마다 Google 쿠키 회전(RotateCookies)으로 로그인 세션 유지
+- 쿠키 만료 감지(`LOGGED_IN` 값) 시 자동 복구 시도, 실패하면 HA 알림 표시 (`notify_cookie_invalid`, 정상화되면 자동 제거)
+- 웹 UI **쿠키 업데이트** 버튼: cookies.txt 파일 선택/붙여넣기 → 저장 후 즉시 로그인 확인 (기존 파일은 `.bak` 보관)
+- `POST /api/cookies` (Ingress 경유만 허용), `/api/health`에 `cookie_problem`, `cookie_maintenance` 추가
+- 쿠키 기능 단위 테스트 (`tests/`)
+
+### 변경
+- 쿠키 파일을 매번 새로 읽지 않고 하나의 세션을 유지. 파일이 바깥에서 바뀌면 자동으로 다시 읽음
+- 로그아웃 응답 시 구독 채널 목록을 비우지 않고 직전 데이터 유지
+- `homeassistant_api: true` (HA 알림용)
+
 ## [1.5.3] - 2026-05-10
 
 ### 일반 사용자 사이드바 노출 허용
