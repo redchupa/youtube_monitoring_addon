@@ -10,10 +10,12 @@ YouTube /feed/history 페이지에서 ytInitialData JSON 파싱.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
+import time
 from typing import Any
 from urllib.parse import unquote
 
@@ -28,6 +30,11 @@ MAX_RECOMMENDED_ITEMS = 3
 
 # YouTube ytcfg에 LOGGED_IN 플래그가 매 응답마다 포함됨.
 # 만료된 쿠키일 경우 "LOGGED_IN":false 로 응답하므로 신뢰 가능한 지표.
+INNERTUBE_BROWSE_URL = "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false"
+DEFAULT_CLIENT_VERSION = "2.20261106.00.00"
+CHANNEL_LIST_TTL = 6 * 3600
+_CLIENT_VERSION_RE = re.compile(r'"INNERTUBE_CLIENT_VERSION"\s*:\s*"([0-9.]+)"')
+
 _LOGGED_IN_RE = re.compile(r"""["']LOGGED_IN["']\s*:\s*(true|false)""")
 
 
@@ -89,6 +96,13 @@ class YouTubeHistoryFetcher:
         self.history_data: list[dict[str, Any]] = []
         self.subscriptions_data: dict[str, Any] | None = None  # {total_count, channels: [{channel_name}]}
         self.recommended_data: list[dict[str, Any]] | None = None  # 최대 3개 추천 영상
+        # 계정의 모든 채널(본채널 + 브랜드 채널) 수집
+        self.scan_all_channels = True
+        self._channels: list[dict[str, Any]] | None = None
+        self._channels_at = 0.0
+        self._client_version = DEFAULT_CLIENT_VERSION
+        self.history_by_channel: dict[str, list[dict[str, Any]]] = {}
+        self.subscription_channel_keys: list[str] | None = None  # 구독 목록을 만든 채널 구성 (None=이번 조회 실패)
 
     def _get_session(self) -> requests.Session | None:
         """쿠키 파일 기반 지속 세션 (응답 쿠키 자동 반영)."""
@@ -307,47 +321,152 @@ class YouTubeHistoryFetcher:
             _LOGGER.debug("Extract Shorts error: %s", err)
             return None
 
-    def fetch_history(self) -> list[dict[str, Any]]:
-        """
-        /feed/history 페이지 조회 → ytInitialData 파싱 → 영상 목록 반환.
-        우선순위: lockup > videoRenderer > Shorts.
-        """
+    # ── 계정의 모든 채널(본채널 + 브랜드 채널) ───────────────────
+    def list_channels(self) -> list[dict[str, Any]]:
+        """계정 채널 목록 [{name, page_id(None=본채널), selected}]. 6시간 캐시, 실패 시 []."""
+        now = time.time()
+        if self._channels is not None and now - self._channels_at < CHANNEL_LIST_TTL:
+            return self._channels
         try:
-            response = self._get("https://www.youtube.com/feed/history")
-            if response is None:
-                self.history_data = []
-                return []
-            if response.status_code == 429:
-                _LOGGER.warning("YouTube rate limit (429). scan_interval을 늘려주세요.")
-                self.history_data = []
-                return []
-            response.raise_for_status()
-        except requests.exceptions.RequestException as err:
-            _LOGGER.error("YouTube request error: %s", err)
-            self.history_data = []
-            return []
+            resp = self._get("https://www.youtube.com/getAccountSwitcherEndpoint")
+            if resp is None or resp.status_code != 200:
+                return self._channels or []
+            text = resp.text
+            data = json.loads(text[text.index("{"):])
+        except (requests.exceptions.RequestException, ValueError) as err:
+            _LOGGER.debug("[채널] 목록 조회 실패: %s", err)
+            return self._channels or []
 
-        html = response.text
-        if self._apply_login_state(html) is False:
-            self.history_data = []
-            return []
+        found: list[dict[str, Any]] = []
 
-        # ytInitialData JSON 추출 (두 가지 패턴 지원)
-        match = re.search(r"var ytInitialData\s*=\s*({.*?});", html, re.DOTALL)
-        if not match:
-            match = re.search(r"ytInitialData\s*=\s*({.*?});", html, re.DOTALL)
-        if not match:
-            _LOGGER.error("Cannot find ytInitialData in response")
-            self.history_data = []
-            return []
+        def walk(node: Any) -> None:
+            if isinstance(node, dict):
+                item = node.get("accountItem")
+                if isinstance(item, dict) and item.get("hasChannel", True):
+                    page_id = None
+                    tokens = (item.get("serviceEndpoint", {}).get("selectActiveIdentityEndpoint", {})
+                              .get("supportedTokens", []))
+                    for tok in tokens if isinstance(tokens, list) else []:
+                        pid = (tok.get("pageIdToken") or {}).get("pageId") if isinstance(tok, dict) else None
+                        if pid:
+                            page_id = str(pid)
+                    name = (item.get("accountName") or {}).get("simpleText") or "?"
+                    found.append({"name": name, "page_id": page_id, "selected": bool(item.get("isSelected"))})
+                for v in node.values():
+                    walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v)
 
+        walk(data)
+        unique: dict[Any, dict[str, Any]] = {}
+        for ch in found:
+            unique.setdefault(ch["page_id"], ch)
+        channels = list(unique.values())
+        if channels:
+            if self._channels is None or [c["page_id"] for c in channels] != [c["page_id"] for c in self._channels]:
+                _LOGGER.info("[채널] 계정 채널 %d개: %s", len(channels), ", ".join(c["name"] for c in channels))
+            self._channels, self._channels_at = channels, now
+        return self._channels or []
+
+    def _innertube_browse(self, browse_id: str, page_id: str | None) -> dict | None:
+        """InnerTube browse 호출 (채널 지정 가능). 실패 시 None."""
+        with self.cookies.lock:
+            session = self._get_session()
+            if session is None:
+                return None
+            sapisid = next((c.value for c in session.cookies
+                            if c.name in ("SAPISID", "__Secure-3PAPISID") and c.value), None)
+            if not sapisid:
+                return None
+            ts = int(time.time())
+            digest = hashlib.sha1(f"{ts} {sapisid} https://www.youtube.com".encode()).hexdigest()
+            context: dict[str, Any] = {"client": {"clientName": "WEB", "clientVersion": self._client_version,
+                                                  "hl": "ko", "gl": "KR"}}
+            headers = {
+                "Authorization": f"SAPISIDHASH {ts}_{digest}",
+                "X-Origin": "https://www.youtube.com",
+                "Origin": "https://www.youtube.com",
+                "X-Goog-AuthUser": "0",
+                "Accept": "*/*",
+                "Sec-Fetch-Mode": "cors",
+            }
+            if page_id:
+                context["user"] = {"onBehalfOfUser": page_id}
+                headers["X-Goog-PageId"] = page_id
+            try:
+                resp = session.post(INNERTUBE_BROWSE_URL, json={"context": context, "browseId": browse_id},
+                                    headers=headers, timeout=15)
+            except requests.exceptions.RequestException as err:
+                _LOGGER.debug("[채널] browse %s 실패: %s", browse_id, err)
+                return None
+            finally:
+                try:
+                    self.cookies.save_if_changed()
+                except Exception:
+                    pass
+        if resp.status_code != 200:
+            _LOGGER.debug("[채널] browse %s HTTP %s", browse_id, resp.status_code)
+            return None
         try:
-            data = json.loads(match.group(1))
-        except json.JSONDecodeError as err:
-            _LOGGER.error("Parse ytInitialData error: %s", err)
-            self.history_data = []
-            return []
+            data = resp.json()
+        except ValueError:
+            return None
+        return data if isinstance(data, dict) else None
 
+    def _multi_channels(self) -> list[dict[str, Any]]:
+        """다채널 수집 대상. 옵션이 꺼져 있거나 채널이 1개면 []."""
+        if not self.scan_all_channels:
+            return []
+        channels = self.list_channels()
+        return channels if len(channels) > 1 else []
+
+    def _merge_all_channels_history(self, default_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """모든 채널 시청 기록을 모은다. history_by_channel에 채널별 결과, 반환은 채널을 번갈아 섞은 목록."""
+        channels = self._multi_channels()
+        by_channel: dict[str, list[dict[str, Any]]] = {}
+        for ch in channels:
+            data = self._innertube_browse("FEhistory", ch["page_id"])
+            if data is not None:
+                by_channel[ch["page_id"] or "main"] = self._parse_history_data(data)
+            time.sleep(1)
+        if not by_channel:
+            self.history_by_channel = {"default": default_list}
+            return default_list
+        self.history_by_channel = by_channel
+        merged: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        lists = list(by_channel.values())
+        for i in range(max(len(x) for x in lists)):
+            for lst in lists:
+                if i < len(lst) and lst[i].get("video_id") not in seen:
+                    seen.add(lst[i].get("video_id"))
+                    merged.append(lst[i])
+        return merged
+
+    def _merge_all_channels_subscriptions(self, default_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """모든 채널 구독의 합집합. 하나라도 실패하면 불완전한 목록 대신 None 표시용으로 기본 목록 반환."""
+        channels = self._multi_channels()
+        if not channels:
+            self.subscription_channel_keys = ["default"]
+            return default_list
+        union: dict[str, dict[str, Any]] = {}
+        for ch in channels:
+            data = self._innertube_browse("FEchannels", ch["page_id"])
+            time.sleep(1)
+            if data is None:
+                # 일부 채널만 실패하면 목록이 줄어 보이므로 이번 주기는 기본(선택 채널) 결과를 쓰지 않고 이전 값 유지
+                self.subscription_channel_keys = None
+                return []
+            for c in self._parse_channels_data(data):
+                union.setdefault(c.get("channel_id") or c.get("channel_name"), c)
+        self.subscription_channel_keys = sorted(ch["page_id"] or "main" for ch in channels)
+        merged = list(union.values())
+        merged.sort(key=lambda c: (c.get("channel_name") or ""))
+        return merged
+
+    def _parse_history_data(self, data: dict) -> list[dict[str, Any]]:
+        """ytInitialData / InnerTube browse(FEhistory) 응답에서 영상 목록 추출."""
         # 탭 → 섹션 → itemSectionRenderer.contents 경로 수집
         all_paths: list[list] = []
         try:
@@ -366,7 +485,6 @@ class YouTubeHistoryFetcher:
             pass
 
         if not all_paths:
-            self.history_data = []
             return []
 
         # 우선순위별 수집: lockup(일반) > videoRenderer(일반) > Shorts
@@ -408,51 +526,10 @@ class YouTubeHistoryFetcher:
                                 break
 
         history_list = lockups + video_renderers + shorts_list
-        self.history_data = history_list[:MAX_HISTORY_ITEMS]
-        # 로그인 마커가 명시적으로 발견된 경우에만 valid 갱신 (위에서 처리)
-        # 그렇지 않으면 데이터 존재 여부를 보조 지표로 사용
-        if history_list and not self.cookies_valid:
-            # 데이터는 있는데 마커가 명시 안 됨 → 일단 유효로 간주 (보수적)
-            self.cookies_valid = True
-        return self.history_data
+        return history_list
 
-    def fetch_subscriptions(self) -> dict[str, Any] | None:
-        """
-        /feed/channels 페이지 조회 → 구독 채널 목록 반환.
-        Returns: {total_count: int, channels: [{channel_name: str}, ...]} 또는 None
-        """
-        try:
-            response = self._get("https://www.youtube.com/feed/channels")
-            if response is None:
-                self.subscriptions_data = None
-                return None
-            if response.status_code == 429:
-                _LOGGER.warning("YouTube rate limit (429). scan_interval을 늘려주세요.")
-                return self.subscriptions_data  # 기존 데이터 유지
-            response.raise_for_status()
-        except requests.exceptions.RequestException as err:
-            _LOGGER.error("YouTube subscriptions request error: %s", err)
-            self.subscriptions_data = None
-            return None
-
-        html = response.text
-        if self._apply_login_state(html) is False:
-            return self.subscriptions_data  # 로그아웃: 기존 데이터 유지 (변경 이력 오염 방지)
-        match = re.search(r"var ytInitialData\s*=\s*({.*?});", html, re.DOTALL)
-        if not match:
-            match = re.search(r"ytInitialData\s*=\s*({.*?});", html, re.DOTALL)
-        if not match:
-            _LOGGER.debug("Cannot find ytInitialData in channels page")
-            self.subscriptions_data = {"total_count": 0, "channels": []}
-            return self.subscriptions_data
-
-        try:
-            data = json.loads(match.group(1))
-        except json.JSONDecodeError as err:
-            _LOGGER.error("Parse channels ytInitialData error: %s", err)
-            self.subscriptions_data = {"total_count": 0, "channels": []}
-            return self.subscriptions_data
-
+    def _parse_channels_data(self, data: dict) -> list[dict[str, Any]]:
+        """ytInitialData / InnerTube browse(FEchannels) 응답에서 구독 채널 목록 추출 (정렬 포함)."""
         channel_list = None
         try:
             tabs = data["contents"]["twoColumnBrowseResultsRenderer"]["tabs"]
@@ -481,8 +558,7 @@ class YouTubeHistoryFetcher:
             pass
 
         if not channel_list:
-            self.subscriptions_data = {"total_count": 0, "channels": []}
-            return self.subscriptions_data
+            return []
 
         channels = []
         for item in channel_list:
@@ -556,6 +632,107 @@ class YouTubeHistoryFetcher:
             return (2, name)  # 숫자·특수문자 등
 
         channels.sort(key=_channel_sort_key)
+
+        return channels
+
+    def fetch_history(self) -> list[dict[str, Any]]:
+        """
+        /feed/history 페이지 조회 → ytInitialData 파싱 → 영상 목록 반환.
+        우선순위: lockup > videoRenderer > Shorts.
+        """
+        try:
+            response = self._get("https://www.youtube.com/feed/history")
+            if response is None:
+                self.history_data = []
+                return []
+            if response.status_code == 429:
+                _LOGGER.warning("YouTube rate limit (429). scan_interval을 늘려주세요.")
+                self.history_data = []
+                return []
+            response.raise_for_status()
+        except requests.exceptions.RequestException as err:
+            _LOGGER.error("YouTube request error: %s", err)
+            self.history_data = []
+            return []
+
+        html = response.text
+        if self._apply_login_state(html) is False:
+            self.history_data = []
+            return []
+
+        # ytInitialData JSON 추출 (두 가지 패턴 지원)
+        match = re.search(r"var ytInitialData\s*=\s*({.*?});", html, re.DOTALL)
+        if not match:
+            match = re.search(r"ytInitialData\s*=\s*({.*?});", html, re.DOTALL)
+        if not match:
+            _LOGGER.error("Cannot find ytInitialData in response")
+            self.history_data = []
+            return []
+
+        try:
+            data = json.loads(match.group(1))
+        except json.JSONDecodeError as err:
+            _LOGGER.error("Parse ytInitialData error: %s", err)
+            self.history_data = []
+            return []
+
+        cv = _CLIENT_VERSION_RE.search(html)
+        if cv:
+            self._client_version = cv.group(1)
+        history_list = self._parse_history_data(data)
+        history_list = self._merge_all_channels_history(history_list)
+        self.history_data = history_list[:MAX_HISTORY_ITEMS]
+        # 로그인 마커가 명시적으로 발견된 경우에만 valid 갱신 (위에서 처리)
+        # 그렇지 않으면 데이터 존재 여부를 보조 지표로 사용
+        if history_list and not self.cookies_valid:
+            # 데이터는 있는데 마커가 명시 안 됨 → 일단 유효로 간주 (보수적)
+            self.cookies_valid = True
+        return self.history_data
+
+    def fetch_subscriptions(self) -> dict[str, Any] | None:
+        """
+        /feed/channels 페이지 조회 → 구독 채널 목록 반환.
+        Returns: {total_count: int, channels: [{channel_name: str}, ...]} 또는 None
+        """
+        try:
+            response = self._get("https://www.youtube.com/feed/channels")
+            if response is None:
+                self.subscriptions_data = None
+                return None
+            if response.status_code == 429:
+                _LOGGER.warning("YouTube rate limit (429). scan_interval을 늘려주세요.")
+                return self.subscriptions_data  # 기존 데이터 유지
+            response.raise_for_status()
+        except requests.exceptions.RequestException as err:
+            _LOGGER.error("YouTube subscriptions request error: %s", err)
+            self.subscriptions_data = None
+            return None
+
+        html = response.text
+        if self._apply_login_state(html) is False:
+            return self.subscriptions_data  # 로그아웃: 기존 데이터 유지 (변경 이력 오염 방지)
+        match = re.search(r"var ytInitialData\s*=\s*({.*?});", html, re.DOTALL)
+        if not match:
+            match = re.search(r"ytInitialData\s*=\s*({.*?});", html, re.DOTALL)
+        if not match:
+            _LOGGER.debug("Cannot find ytInitialData in channels page")
+            self.subscriptions_data = {"total_count": 0, "channels": []}
+            return self.subscriptions_data
+
+        try:
+            data = json.loads(match.group(1))
+        except json.JSONDecodeError as err:
+            _LOGGER.error("Parse channels ytInitialData error: %s", err)
+            self.subscriptions_data = {"total_count": 0, "channels": []}
+            return self.subscriptions_data
+
+        channels = self._parse_channels_data(data)
+        channels = self._merge_all_channels_subscriptions(channels)
+        if not channels:
+            if self.subscription_channel_keys is None:
+                return self.subscriptions_data  # 일부 채널 조회 실패: 이전 목록 유지
+            self.subscriptions_data = {"total_count": 0, "channels": []}
+            return self.subscriptions_data
 
         prev_total = (self.subscriptions_data or {}).get("total_count")
         if prev_total != len(channels):

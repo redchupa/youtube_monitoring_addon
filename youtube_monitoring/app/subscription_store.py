@@ -125,6 +125,7 @@ def repair_mass_removals() -> int:
 
 def update_subscription_changes(
     current_channels: list[dict[str, str]],
+    channel_keys: list[str] | None = None,
 ) -> dict[str, dict[str, list[str]]]:
     """
     현재 구독 목록과 이전 스냅샷 비교 → 월별 변경 누적 후 저장.
@@ -137,6 +138,21 @@ def update_subscription_changes(
 
     last = store.get("last_snapshot")
     monthly = store.get("monthly_changes", {})
+
+    # 구독 목록을 만든 채널 구성(본채널/브랜드 채널)이 바뀌면 비교 대상이 달라지므로
+    # 신규/취소로 기록하지 않고 기준 목록만 새로 잡는다.
+    prev_keys = store.get("channel_keys", ["default"])
+    if channel_keys is not None and channel_keys != prev_keys:
+        _LOGGER.info("[구독] 수집 채널 구성 변경 %s → %s: 변경 기록 없이 기준 목록 갱신 (%d개)",
+                     prev_keys, channel_keys, len(current_names))
+        store["channel_keys"] = channel_keys
+        store.pop("pending_drop", None)
+        store["last_snapshot"] = {
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "channels": list(current_names),
+        }
+        save_subscription_store(store)
+        return store.get("monthly_changes", {})
 
     if last and last.get("channels"):
         prev_names = set(last.get("channels", []))

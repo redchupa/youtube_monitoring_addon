@@ -350,6 +350,16 @@ class SubscriptionGuardTest(unittest.TestCase):
         month = next(iter(self.store()["monthly_changes"].values()))
         self.assertEqual(sorted(month["removed"]), ["b", "c"])
 
+    def test_channel_set_change_resets_baseline_without_records(self) -> None:
+        self.ss.update_subscription_changes(self.chans(["a", "b", "c"]))  # 기존(단일 채널)
+        self.ss.update_subscription_changes(self.chans(["a", "x", "y"]), ["999", "main"])  # 다채널 전환
+        st = self.store()
+        self.assertEqual(st.get("monthly_changes"), {})
+        self.assertEqual(sorted(st["last_snapshot"]["channels"]), ["a", "x", "y"])
+        self.ss.update_subscription_changes(self.chans(["a", "x"]), ["999", "main"])  # 이후 변화는 정상 기록
+        month = next(iter(self.store()["monthly_changes"].values()))
+        self.assertEqual(month["removed"], ["y"])
+
     def test_repair_mass_removals(self) -> None:
         removed = [f"ch{i}" for i in range(374)]
         with open(self.path, "w", encoding="utf-8") as f:
@@ -366,6 +376,57 @@ class SubscriptionGuardTest(unittest.TestCase):
         self.assertEqual(st["monthly_changes"]["2026-10"]["removed"], ["old1"])  # 정상 월은 그대로
         self.assertEqual(len(st["last_snapshot"]["channels"]), 378)
         self.assertEqual(self.ss.repair_mass_removals(), 0)  # 두 번째 실행은 아무것도 안 함
+
+
+class MultiChannelTest(CookieTestBase):
+    SWITCHER = ")]}'" + chr(10) + json.dumps({"data": {"actions": [{"getMultiPageMenuAction": {"menu": {"sections": [
+        {"accountItem": {"accountName": {"simpleText": "Main"}, "hasChannel": True, "isSelected": False,
+                         "serviceEndpoint": {"selectActiveIdentityEndpoint": {"supportedTokens": [
+                             {"accountStateToken": {"obfuscatedGaiaId": "1"}}]}}}},
+        {"accountItem": {"accountName": {"simpleText": "Brand"}, "hasChannel": True, "isSelected": True,
+                         "serviceEndpoint": {"selectActiveIdentityEndpoint": {"supportedTokens": [
+                             {"pageIdToken": {"pageId": "999"}}]}}}},
+    ]}}}]}})
+
+    @staticmethod
+    def hist(*ids):
+        return {"contents": {"twoColumnBrowseResultsRenderer": {"tabs": [{"tabRenderer": {"content": {
+            "sectionListRenderer": {"contents": [{"itemSectionRenderer": {"contents": [
+                {"videoRenderer": {"videoId": i, "title": {"simpleText": i}}} for i in ids]}}]}}}}]}}}
+
+    def test_list_channels_parses_main_and_brand(self) -> None:
+        self.write_cookies()
+        f = YouTubeHistoryFetcher(self.path)
+        with mock.patch.object(f, "_get", return_value=FakeResponse(200, self.SWITCHER)):
+            chans = f.list_channels()
+        self.assertEqual([(c["name"], c["page_id"], c["selected"]) for c in chans],
+                         [("Main", None, False), ("Brand", "999", True)])
+
+    def test_history_merged_from_all_channels(self) -> None:
+        self.write_cookies()
+        f = YouTubeHistoryFetcher(self.path)
+        f._channels, f._channels_at = [{"name": "Main", "page_id": None}, {"name": "Brand", "page_id": "999"}], time.time()
+        pages = {None: self.hist("mainAAAAAA1", "mainAAAAAA2"), "999": self.hist("brandBBBBB1")}
+        with mock.patch.object(f, "_innertube_browse", side_effect=lambda bid, pid: pages[pid]),                 mock.patch.object(f, "_get_best_thumbnail", return_value=""),                 mock.patch("app.fetcher.time.sleep"):
+            merged = f._merge_all_channels_history([])
+        self.assertEqual([v["video_id"] for v in merged], ["mainAAAAAA1", "brandBBBBB1", "mainAAAAAA2"])
+        self.assertEqual(sorted(f.history_by_channel), ["999", "main"])
+
+    def test_single_channel_or_disabled_uses_default(self) -> None:
+        self.write_cookies()
+        f = YouTubeHistoryFetcher(self.path)
+        f.scan_all_channels = False
+        default = [{"video_id": "x"}]
+        self.assertIs(f._merge_all_channels_history(default), default)
+        self.assertEqual(f.history_by_channel, {"default": default})
+
+    def test_subscription_failure_keeps_previous(self) -> None:
+        self.write_cookies()
+        f = YouTubeHistoryFetcher(self.path)
+        f._channels, f._channels_at = [{"name": "Main", "page_id": None}, {"name": "Brand", "page_id": "999"}], time.time()
+        with mock.patch.object(f, "_innertube_browse", return_value=None), mock.patch("app.fetcher.time.sleep"):
+            self.assertEqual(f._merge_all_channels_subscriptions([{"channel_name": "a"}]), [])
+        self.assertIsNone(f.subscription_channel_keys)
 
 
 class CookieUploadApiTest(CookieTestBase):
@@ -461,7 +522,10 @@ class CookieUploadApiTest(CookieTestBase):
         self.assertEqual(self._post_ingest(bad_id)[0], 400)
         self.assertEqual(self._post_ingest(b"[1,2,3]")[0], 400)  # 객체가 아닌 JSON
         self.assertEqual(self._post_ingest(b"{not json")[0], 400)
-        self.assertEqual(self._post_ingest(b"x" * (70 * 1024))[0], 413)  # 크기 제한
+        try:  # 크기 제한: 413 또는 (본문을 다 받기 전에 응답해) 연결 종료
+            self.assertEqual(self._post_ingest(b"x" * (70 * 1024))[0], 413)
+        except (ConnectionError, urllib.error.URLError):
+            pass
 
     def test_ingest_shorts_skipped(self) -> None:
         body = json.dumps({"video_id": "shortsID001", "url": "https://www.youtube.com/shorts/shortsID001"}).encode()

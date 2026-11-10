@@ -67,6 +67,7 @@
 | scan_interval_recommended | int | 1800 | 추천 영상 갱신 간격(초), 60~3600. fetch_recommended가 true일 때만 적용 |
 | timezone | str | Asia/Seoul | 로그 타임스탬프 및 **시청 기록 저장 시 날짜** 기준 타임존 (예: Europe/Paris, America/New_York) |
 | notify_cookie_invalid | bool | true | 쿠키가 만료되고 자동 복구도 실패하면 HA 알림 표시 |
+| scan_all_channels | bool | true | 계정의 모든 채널(본채널 + 브랜드 채널) 시청 기록·구독을 합쳐서 수집. 끄면 쿠키를 내보낼 때 선택돼 있던 채널만 |
 
 ### Ingress
 

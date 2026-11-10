@@ -1,5 +1,5 @@
 name: "YouTube Monitoring"
-version: "1.5.6"
+version: "1.5.7"
 slug: "youtube_monitoring"
 description: "YouTube 쿠키 기반 시청 기록·구독·추천 영상 조회 + MQTT Discovery 센서 (쿠키 자동 갱신)."
 url: "http://homeassistant.local:8765"
@@ -38,6 +38,7 @@ options:
   scan_interval_recommended: 1800
   timezone: "Asia/Seoul"
   notify_cookie_invalid: true
+  scan_all_channels: true
 schema:
   cookies_path: "str"
   scan_interval: "int(30,300)?"
@@ -47,3 +48,4 @@ schema:
   scan_interval_recommended: "int(60,3600)?"
   timezone: "str?"
   notify_cookie_invalid: "bool?"
+  scan_all_channels: "bool?"

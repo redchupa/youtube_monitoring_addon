@@ -32,6 +32,7 @@ YouTube 쿠키만으로 시청 기록을 **일별/월별**로 조회하는 Home 
 | scan_interval_recommended | 추천 영상 갱신(초) | 1800 |
 | timezone | 로그·시청 기록 날짜용 타임존 | Asia/Seoul |
 | notify_cookie_invalid | 쿠키 만료·자동 복구 실패 시 HA 알림 | true |
+| scan_all_channels | 계정의 모든 채널(본채널+브랜드) 기록 합쳐서 수집 | true |
 
 ## 문서
 

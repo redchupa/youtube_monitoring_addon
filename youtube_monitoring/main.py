@@ -82,6 +82,7 @@ mqtt_pub: MqttPublisher | None = None
 _history_lock = threading.Lock()
 _subs_lock = threading.Lock()
 _last_seen_video_id: str | None = None
+_last_seen_by_channel: dict[str, str] = {}  # 채널별 마지막으로 본 최신 video_id
 _recent_added: dict[str, float] = {}  # video_id -> timestamp (5분 내 중복 방지)
 _last_recommended_fetch: float = 0  # 추천 영상 마지막 fetch 시각
 _last_manual_refresh_recommended: float = 0  # 수동 새로고침 마지막 시각 (10분 쿨다운)
@@ -127,6 +128,7 @@ def load_options() -> dict:
         "scan_interval_recommended": int(os.environ.get("SCAN_INTERVAL_RECOMMENDED", "1800")),
         "timezone": os.environ.get("TZ", "Asia/Seoul"),
         "notify_cookie_invalid": _parse_bool(os.environ.get("NOTIFY_COOKIE_INVALID", "true")),
+        "scan_all_channels": _parse_bool(os.environ.get("SCAN_ALL_CHANNELS", "true")),
     }
     try:
         if os.path.exists(options_path):
@@ -137,6 +139,8 @@ def load_options() -> dict:
                 defaults["fetch_recommended"] = _parse_bool(opts["fetch_recommended"])
             if "scan_interval_recommended" in opts:
                 defaults["scan_interval_recommended"] = int(opts["scan_interval_recommended"])
+            if "scan_all_channels" in opts:
+                defaults["scan_all_channels"] = _parse_bool(opts["scan_all_channels"])
             if "notify_cookie_invalid" in opts:
                 defaults["notify_cookie_invalid"] = _parse_bool(opts["notify_cookie_invalid"])
     except (json.JSONDecodeError, OSError) as err:
@@ -359,7 +363,7 @@ def fetch_loop() -> None:
                 sub_data = fetcher.subscriptions_data
                 if sub_data and sub_data.get("channels"):
                     with _subs_lock:
-                        update_subscription_changes(sub_data["channels"])
+                        update_subscription_changes(sub_data["channels"], fetcher.subscription_channel_keys)
                 time.sleep(2)
 
             if fetch_recommended:
@@ -378,21 +382,26 @@ def fetch_loop() -> None:
 
             videos = fetcher.history_data or []
 
-            if videos:
-                most_recent = videos[0]
+            # 채널별(본채널 + 브랜드 채널) 가장 최근 영상을 각각 기록
+            by_channel = fetcher.history_by_channel or {"default": videos}
+            now = time.time()
+            for ch_key, ch_videos in by_channel.items():
+                if not ch_videos:
+                    continue
+                most_recent = ch_videos[0]
                 video_id = most_recent.get("video_id")
-                if video_id and video_id != "N/A":
-                    now = time.time()
-                    if video_id != _last_seen_video_id:
-                        last_added = _recent_added.get(video_id, 0)
-                        if now - last_added >= duplicate_sec:
-                            if on_video_change(most_recent):
-                                _recent_added[video_id] = now
-                        _last_seen_video_id = video_id
-                        # 최근 시청 영상 변경 → MQTT 발행
-                        if mqtt_pub and mqtt_pub.is_connected():
-                            mqtt_pub.publish_recent_watched(videos)
-                    _recent_added = {k: v for k, v in _recent_added.items() if now - v < duplicate_sec * 2}
+                if not video_id or video_id == "N/A" or video_id == _last_seen_by_channel.get(ch_key):
+                    continue
+                if now - _recent_added.get(video_id, 0) >= duplicate_sec:
+                    if on_video_change(most_recent):
+                        _recent_added[video_id] = now
+                _last_seen_by_channel[ch_key] = video_id
+                _last_seen_video_id = video_id
+                # 최근 시청 영상 변경 → MQTT 발행 (방금 바뀐 영상을 맨 앞에)
+                if mqtt_pub and mqtt_pub.is_connected():
+                    rest = [v for v in videos if v.get("video_id") != video_id]
+                    mqtt_pub.publish_recent_watched([most_recent] + rest)
+            _recent_added = {k: v for k, v in _recent_added.items() if now - v < duplicate_sec * 2}
 
             if not fetcher.cookies_valid:
                 _LOGGER.warning("[폴링] 쿠키 무효 | 시청 기록/구독 조회 불가 (자동 복구 실패 시 웹 UI '쿠키 업데이트' 사용)")
@@ -1324,6 +1333,7 @@ def main() -> None:
     _LOGGER.info("[%s] 설정 로드 완료 | cookies_path=%s | port=%s | scan_interval=%ds", "10%", cookies_path, port, interval)
 
     fetcher = YouTubeHistoryFetcher(cookies_path)
+    fetcher.scan_all_channels = bool(opts.get("scan_all_channels", True))
     _LOGGER.info("[%s] 시청 기록 조회 중... (약 1분 소요 됩니다)", "20%")
     fetcher.fetch_history()
     time.sleep(2)
@@ -1343,7 +1353,7 @@ def main() -> None:
     n_subs = len(sub_data.get("channels", [])) if sub_data else 0
     if sub_data and sub_data.get("channels"):
         with _subs_lock:
-            update_subscription_changes(sub_data["channels"])
+            update_subscription_changes(sub_data["channels"], fetcher.subscription_channel_keys)
     _LOGGER.info("[%s] 구독 채널 조회 완료 | %d개 채널 반영", "55%", n_subs)
 
     if opts.get("fetch_recommended", True):
