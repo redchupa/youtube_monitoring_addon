@@ -18,6 +18,7 @@ YouTube 쿠키 자동 유지 관리.
 """
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import tempfile
@@ -31,9 +32,17 @@ import requests
 _LOGGER = logging.getLogger(__name__)
 
 USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+# 1.4.x까지 검증된 요청 헤더 그대로 (바꾸면 YouTube가 페이지를 다르게 렌더링할 수 있음:
+# 1.5.4에서 UA/헤더를 바꾸자 구독 채널 목록이 일부만 내려오는 회귀 발생).
+PAGE_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-us,en;q=0.5",
+    "Sec-Fetch-Mode": "navigate",
+}
 NETSCAPE_HEADER = "# Netscape HTTP Cookie File\n"
 
 ROTATE_PAGE_URL = "https://accounts.youtube.com/RotateCookiesPage?origin=https://www.youtube.com&yt_pid=1"
@@ -58,10 +67,6 @@ def _domain_ok(domain: str) -> bool:
 
 def _snapshot(jar: MozillaCookieJar) -> frozenset[tuple[str, str, str, str | None]]:
     return frozenset((c.domain, c.path, c.name, c.value) for c in jar)
-
-
-def _auth_names(snap: frozenset | None) -> set[str]:
-    return {name for (_d, _p, name, _v) in (snap or ()) if name in AUTH_COOKIE_NAMES}
 
 
 def parse_cookie_text(text: str) -> MozillaCookieJar:
@@ -125,6 +130,8 @@ class CookieManager:
         self._loaded_mtime: int | None = None
         self._saved_snapshot: frozenset | None = None
         self._load_error: str | None = None
+        self._auth_backup: dict[tuple[str, str, str], Any] = {}  # 마지막으로 저장/로드한 로그인 쿠키
+        self._lost_warned: frozenset[str] = frozenset()
         self.last_rotate_at: float = 0.0
         self.last_rotate_ok: bool | None = None
         self.last_rotate_message: str = ""
@@ -159,15 +166,12 @@ class CookieManager:
         self._load_error = None
 
         session = requests.Session()
-        session.headers.update({
-            "User-Agent": USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-us,en;q=0.5",
-        })
+        session.headers = dict(PAGE_HEADERS)  # type: ignore[assignment]  # requests 기본 헤더 미사용 (기존과 동일)
         session.cookies = jar  # type: ignore[assignment]
         self._session, self._jar = session, jar
         self._loaded_mtime = mtime
         self._saved_snapshot = _snapshot(jar)
+        self._backup_auth(jar)
         _LOGGER.info("[쿠키] 파일 로드: %d개 쿠키", len(jar))
         return True
 
@@ -186,19 +190,34 @@ class CookieManager:
         with self.lock:
             if self._jar is None:
                 return False
+            self._restore_lost_auth()
             snap = _snapshot(self._jar)
             if snap == self._saved_snapshot:
                 return False
-            lost = _auth_names(self._saved_snapshot) - _auth_names(snap)
-            if lost:
-                # YouTube가 로그아웃 응답과 함께 로그인 쿠키 삭제를 보낸 경우.
-                # 일시적 오류일 수도 있고 복구(회전)에 필요하므로 파일은 지키고 메모리도 되돌린다.
-                _LOGGER.warning("[쿠키] 서버가 로그인 쿠키 삭제 요청(%s) - 파일은 보존", ", ".join(sorted(lost)))
-                self._load()
-                return False
             self._write_jar(self._jar)
             self._saved_snapshot = snap
+            self._backup_auth(self._jar)
             return True
+
+    def _backup_auth(self, jar: MozillaCookieJar) -> None:
+        self._auth_backup = {
+            (c.domain, c.path, c.name): copy.copy(c) for c in jar if c.name in AUTH_COOKIE_NAMES
+        }
+
+    def _restore_lost_auth(self) -> None:
+        """
+        YouTube가 응답으로 로그인 쿠키 삭제를 보내면(로그아웃 응답 등) 그 쿠키만 되돌린다.
+        일시적 오류일 수 있고 복구(회전)에도 필요하므로 지우지 않는다. 다른 갱신 쿠키는 그대로 저장.
+        """
+        assert self._jar is not None
+        present = {(c.domain, c.path, c.name) for c in self._jar}
+        lost = [key for key in self._auth_backup if key not in present]
+        for key in lost:
+            self._jar.set_cookie(copy.copy(self._auth_backup[key]))
+        names = frozenset(name for (_d, _p, name) in lost)
+        if names and names != self._lost_warned:  # 같은 내용은 한 번만 기록
+            _LOGGER.warning("[쿠키] 서버가 로그인 쿠키 삭제를 요청(%s) - 보존함", ", ".join(sorted(names)))
+        self._lost_warned = names
 
     def _write_jar(self, jar: MozillaCookieJar) -> None:
         directory = os.path.dirname(os.path.abspath(self.path)) or "."
@@ -272,6 +291,8 @@ class CookieManager:
                     data=ROTATE_BODY,
                     headers={
                         "Content-Type": "application/json",
+                        "Accept": "*/*",
+                        "Sec-Fetch-Mode": "cors",
                         "Origin": "https://accounts.youtube.com",
                         "Referer": ROTATE_PAGE_URL,
                     },

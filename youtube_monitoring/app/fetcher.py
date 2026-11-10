@@ -557,6 +557,13 @@ class YouTubeHistoryFetcher:
 
         channels.sort(key=_channel_sort_key)
 
+        prev_total = (self.subscriptions_data or {}).get("total_count")
+        if prev_total != len(channels):
+            # 진단용: 목록이 일부만 내려오는 경우를 로그로 구분할 수 있게
+            _LOGGER.info(
+                "[구독] 채널 %d개 조회 (이전 %s개, continuation=%s, 응답 %dKB)",
+                len(channels), prev_total, '"continuationItemRenderer"' in html, len(html) // 1024,
+            )
         self.subscriptions_data = {"total_count": len(channels), "channels": channels}
         # cookies_valid는 위 LOGGED_IN 마커에서 이미 갱신됨.
         # 마커가 없는 경우 채널 데이터 존재로 보조 판정.

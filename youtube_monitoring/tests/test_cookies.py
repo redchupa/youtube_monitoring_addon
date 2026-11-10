@@ -114,10 +114,26 @@ class CookieManagerTest(CookieTestBase):
         s = cm.session()
         s.cookies.clear(".youtube.com", "/", "SID")  # 로그아웃 응답의 Set-Cookie 삭제처럼
         s.cookies.clear(".youtube.com", "/", "__Secure-1PSID")
-        self.assertFalse(cm.save_if_changed())
+        self.assertFalse(cm.save_if_changed())  # 삭제만 있었으면 저장할 변화 없음
         names = {c.name for c in CookieManager(self.path).session().cookies}
         self.assertTrue({"SID", "__Secure-1PSID"} <= names)
         self.assertTrue(cm.has_auth_cookies())  # 메모리도 원래 쿠키로 복원 → 회전 복구 가능
+        self.assertIs(cm.session(), s)  # 파일 재로드 없이 같은 세션 유지
+
+        # 삭제와 함께 온 다른 갱신 쿠키는 저장돼야 함
+        s.cookies.clear(".youtube.com", "/", "SID")
+        s.cookies.set_cookie(_cookie("__Secure-1PSIDTS", "sidts-after-delete"))
+        self.assertTrue(cm.save_if_changed())
+        values = {c.name: c.value for c in CookieManager(self.path).session().cookies}
+        self.assertEqual(values["__Secure-1PSIDTS"], "sidts-after-delete")
+        self.assertEqual(values["SID"], "sid-value")
+
+    def test_page_headers_match_original(self) -> None:
+        self.write_cookies()
+        h = CookieManager(self.path).session().headers
+        self.assertEqual(h.get("Sec-Fetch-Mode"), "navigate")
+        self.assertIn("Chrome/120.0.0.0", h.get("User-Agent"))
+        self.assertNotIn("Accept-Encoding", h)  # requests 기본 헤더를 섞지 않음 (1.4.x와 동일)
 
     def test_external_file_change_reloads(self) -> None:
         self.write_cookies()
@@ -281,6 +297,75 @@ class MaintainCookiesTest(CookieTestBase):
             self.main.maintain_cookies()
             rot.assert_not_called()
         self.assertEqual(self.services, [])
+
+
+class SubscriptionGuardTest(unittest.TestCase):
+    def setUp(self) -> None:
+        from app import subscription_store as ss
+        self.ss = ss
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "subs.json")
+        self.p = mock.patch.object(ss, "_get_subs_path", return_value=self.path)
+        self.p.start()
+
+    def tearDown(self) -> None:
+        self.p.stop()
+        self.tmp.cleanup()
+
+    def chans(self, names):
+        return [{"channel_name": n} for n in names]
+
+    def store(self):
+        with open(self.path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_mass_drop_not_recorded_until_confirmed(self) -> None:
+        full = [f"ch{i}" for i in range(300)]
+        self.ss.update_subscription_changes(self.chans(full))
+        self.ss.update_subscription_changes(self.chans(full[:4] + ["new"]))  # 일부만 내려온 응답
+        st = self.store()
+        self.assertEqual(st.get("monthly_changes"), {})
+        self.assertEqual(len(st["last_snapshot"]["channels"]), 300)
+        # 정상 응답 복귀 + 실제 변화 1건은 정상 기록
+        self.ss.update_subscription_changes(self.chans(full[1:] + ["real_new"]))
+        month = next(iter(self.store()["monthly_changes"].values()))
+        self.assertEqual(month, {"added": ["real_new"], "removed": ["ch0"]})
+        self.assertNotIn("pending_drop", self.store())
+
+    def test_mass_drop_accepted_after_24h_without_records(self) -> None:
+        full = [f"ch{i}" for i in range(50)]
+        self.ss.update_subscription_changes(self.chans(full))
+        small = self.chans(["a", "b"])
+        with mock.patch.object(self.ss.time, "time", return_value=1000.0):
+            self.ss.update_subscription_changes(small)
+        with mock.patch.object(self.ss.time, "time", return_value=1000.0 + 25 * 3600):
+            self.ss.update_subscription_changes(small)
+        st = self.store()
+        self.assertEqual(sorted(st["last_snapshot"]["channels"]), ["a", "b"])
+        self.assertEqual(st.get("monthly_changes"), {})
+
+    def test_small_changes_still_recorded(self) -> None:
+        self.ss.update_subscription_changes(self.chans(["a", "b", "c"]))
+        self.ss.update_subscription_changes(self.chans(["a"]))  # 2개 취소: 급감 기준(20개) 미만
+        month = next(iter(self.store()["monthly_changes"].values()))
+        self.assertEqual(sorted(month["removed"]), ["b", "c"])
+
+    def test_repair_mass_removals(self) -> None:
+        removed = [f"ch{i}" for i in range(374)]
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({
+                "last_snapshot": {"date": "2026-11-10", "channels": ["x", "y", "z", "w"]},
+                "monthly_changes": {
+                    "2026-11": {"added": ["x", "y"], "removed": removed},
+                    "2026-10": {"added": ["k"], "removed": ["old1"]},
+                },
+            }, f)
+        self.assertEqual(self.ss.repair_mass_removals(), 1)
+        st = self.store()
+        self.assertEqual(st["monthly_changes"]["2026-11"]["removed"], [])
+        self.assertEqual(st["monthly_changes"]["2026-10"]["removed"], ["old1"])  # 정상 월은 그대로
+        self.assertEqual(len(st["last_snapshot"]["channels"]), 378)
+        self.assertEqual(self.ss.repair_mass_removals(), 0)  # 두 번째 실행은 아무것도 안 함
 
 
 class CookieUploadApiTest(CookieTestBase):

@@ -30,6 +30,7 @@ from app.history_store import (
 from app.subscription_store import (
     update_subscription_changes,
     get_monthly_subscription_changes,
+    repair_mass_removals,
 )
 from app.mqtt_publisher import MqttPublisher, get_supervisor_mqtt
 
@@ -252,6 +253,7 @@ def _dismiss_cookie_notification() -> None:
 def _reset_cookie_state() -> None:
     """쿠키가 다시 유효해졌을 때 상태/알림 정리."""
     global _cookie_invalid_since, _cookie_notified, _last_cookie_recovery
+    global _last_subscriptions_fetch, _last_recommended_fetch
     with _cookie_state_lock:
         was_invalid = _cookie_invalid_since is not None
         notified = _cookie_notified
@@ -259,6 +261,9 @@ def _reset_cookie_state() -> None:
         _cookie_notified = False
         _last_cookie_recovery = 0
     if was_invalid:
+        # 만료 동안 비어 있던 구독/추천을 다음 루프에서 바로 다시 조회
+        _last_subscriptions_fetch = 0
+        _last_recommended_fetch = 0
         _LOGGER.info("[쿠키] 다시 유효함")
     if notified:
         _dismiss_cookie_notification()
@@ -1208,7 +1213,7 @@ def _get_ui_html() -> str:
             }
             btn.disabled = true;
             msg.className = 'modal-msg';
-            msg.textContent = '저장 후 YouTube 로그인 상태를 확인하는 중... (최대 20초)';
+            msg.textContent = '저장 후 YouTube 로그인 상태를 확인하는 중... (최대 1분)';
             try {
                 const r = await fetch(apiBase() + 'api/cookies', {
                     method: 'POST',
@@ -1295,6 +1300,11 @@ def main() -> None:
     n_history = len(fetcher.history_data or [])
     _LOGGER.info("[%s] 시청 기록 조회 완료 | 쿠키=%s | 최근 %d건", "30%", "유효" if cookies_ok else "무효", n_history)
 
+    try:
+        with _subs_lock:
+            repair_mass_removals()
+    except Exception as err:
+        _LOGGER.warning("[구독] 오기록 복구 실패: %s", err)
     _LOGGER.info("[%s] 구독 채널 조회 중...", "40%")
     fetcher.fetch_subscriptions()
     _last_subscriptions_fetch = time.time()
