@@ -427,6 +427,55 @@ class CookieUploadApiTest(CookieTestBase):
         self.assertEqual(status, 403)
         self.assertFalse(os.path.exists(self.path))
 
+    def _post_ingest(self, raw: bytes, headers: dict | None = None) -> tuple[int, dict]:
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}/api/ingest", data=raw, method="POST",
+                                     headers={"Content-Type": "application/json", **(headers or {})})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}")
+
+    def test_ingest_sanitizes_untrusted_fields(self) -> None:
+        saved = []
+        evil = {
+            "video_id": "abcDEF12345",
+            "title": "<img src=x onerror=alert(1)>" + "A" * 1000,
+            "channel": "  ch\n\tname  ",
+            "url": "javascript:alert(document.cookie)",
+            "thumbnail": "x\" onerror=\"alert(1)",
+            "duration": "\"><script>alert(1)</script>",
+        }
+        with mock.patch.object(self.main, "on_video_change", side_effect=lambda v: saved.append(v) or True):
+            status, data = self._post_ingest(json.dumps(evil).encode())
+        self.assertEqual(status, 200, data)
+        v = saved[0]
+        self.assertEqual(v["url"], "https://www.youtube.com/watch?v=abcDEF12345")
+        self.assertEqual(v["thumbnail"], "https://img.youtube.com/vi/abcDEF12345/0.jpg")
+        self.assertEqual(v["duration"], "N/A")
+        self.assertEqual(len(v["title"]), 300)
+        self.assertEqual(v["channel"], "ch name")
+
+    def test_ingest_rejects_bad_input(self) -> None:
+        bad_id = json.dumps({"video_id": "../../etc<script>"}).encode()
+        self.assertEqual(self._post_ingest(bad_id)[0], 400)
+        self.assertEqual(self._post_ingest(b"[1,2,3]")[0], 400)  # 객체가 아닌 JSON
+        self.assertEqual(self._post_ingest(b"{not json")[0], 400)
+        self.assertEqual(self._post_ingest(b"x" * (70 * 1024))[0], 413)  # 크기 제한
+
+    def test_ingest_shorts_skipped(self) -> None:
+        body = json.dumps({"video_id": "shortsID001", "url": "https://www.youtube.com/shorts/shortsID001"}).encode()
+        status, data = self._post_ingest(body)
+        self.assertEqual((status, data.get("reason")), (200, "shorts"))
+
+    def test_ui_escapes_attributes(self) -> None:
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/", timeout=10) as r:
+            html = r.read().decode("utf-8")
+        self.assertIn("function safeUrl", html)
+        self.assertIn("'\"': '&quot;'", html)
+        self.assertNotIn('href="${v.url}"', html)
+        self.assertNotIn('src="${v.thumbnail', html)
+
     def test_ui_has_cookie_button(self) -> None:
         with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/", timeout=10) as r:
             html = r.read().decode("utf-8")

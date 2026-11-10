@@ -71,6 +71,7 @@ MASS_DROP_MIN = 20  # 이 개수 이상이 한 번에 빠지고
 MASS_DROP_RATIO = 0.5  # 이전 목록의 절반 이상이 빠지면 '급감'으로 판단
 MASS_DROP_CONFIRM_SEC = 24 * 3600
 MASS_REMOVAL_REPAIR_MIN = 100  # 한 달 '구독 취소'가 이 이상이면 오기록으로 보고 복구
+REPAIR_ID = "1.5.5-mass-removal"  # 복구는 설치당 한 번만 (이후 데이터는 급감 가드가 보호)
 
 
 def _is_mass_drop(prev_count: int, removed_count: int) -> bool:
@@ -94,6 +95,9 @@ def repair_mass_removals() -> int:
     해당 월의 removed를 비우고, 빠졌던 채널을 기준 목록에 되돌린다. 복구한 월 수 반환.
     """
     store = load_subscription_store()
+    done = store.get("repairs_done") or []
+    if REPAIR_ID in done:
+        return 0
     monthly = store.get("monthly_changes") or {}
     snapshot = store.get("last_snapshot") or {}
     names = set(snapshot.get("channels") or [])
@@ -104,7 +108,9 @@ def repair_mass_removals() -> int:
             names |= set(removed)
             change["removed"] = []
             repaired.append((month, len(removed)))
+    store["repairs_done"] = list(done) + [REPAIR_ID]
     if not repaired:
+        save_subscription_store(store)
         return 0
     store["last_snapshot"] = {
         "date": snapshot.get("date") or datetime.now().strftime("%Y-%m-%d"),

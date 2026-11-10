@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -95,6 +96,9 @@ COOKIE_RECOVERY_RETRY_SEC = 1800  # 만료 상태에서 자동 복구 재시도 
 COOKIE_NOTIFICATION_ID = "youtube_monitoring_cookie"
 INGRESS_PROXY_IP = "172.30.32.2"  # HA Supervisor Ingress 프록시 주소
 MAX_COOKIE_UPLOAD_BYTES = 1_000_000
+MAX_INGEST_BYTES = 64 * 1024
+_VIDEO_ID_RE = re.compile(r"[A-Za-z0-9_-]{6,20}")
+_DURATION_RE = re.compile(r"(\d{1,2}:)?\d{1,2}:\d{2}|LIVE")
 
 _cookie_invalid_since: float | None = None
 _last_cookie_recovery: float = 0
@@ -139,6 +143,12 @@ def load_options() -> dict:
         _LOGGER.warning("Failed to load options.json: %s, using env defaults", err)
 
     return defaults
+
+
+def _clean_text(value: Any, limit: int = 300) -> str:
+    """외부 입력 글자 값 정리: 공백 정규화 + 길이 제한. 비면 'N/A'."""
+    text = " ".join(str(value if value is not None else "").split())[:limit]
+    return text or "N/A"
 
 
 def _is_shorts(video_data: dict) -> bool:
@@ -396,6 +406,9 @@ def fetch_loop() -> None:
 class YouTubeMonitoringHandler(BaseHTTPRequestHandler):
     """HTTP 요청 핸들러: REST API + 웹 UI."""
 
+    # 단일 스레드 서버라 느리거나 멈춘 연결 하나가 전체를 막지 않도록 소켓 타임아웃
+    timeout = 30
+
     def log_message(self, format, *args):
         _LOGGER.debug("%s - %s", self.address_string(), format % args)
 
@@ -505,16 +518,27 @@ class YouTubeMonitoringHandler(BaseHTTPRequestHandler):
         """실시간 video_id 수신 → yt_history.json에 즉시 저장."""
         global _last_seen_video_id, _recent_added
 
-        content_len = int(self.headers.get("Content-Length", 0))
+        try:
+            content_len = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            content_len = -1
+        if content_len < 0 or content_len > MAX_INGEST_BYTES:
+            self.send_json({"error": "invalid_size"}, status=413)
+            return
         try:
             body = self.rfile.read(content_len).decode("utf-8")
             data = json.loads(body) if body else {}
         except (json.JSONDecodeError, ValueError):
             self.send_json({"error": "Invalid JSON"}, status=400)
             return
+        if not isinstance(data, dict):
+            self.send_json({"error": "Invalid JSON"}, status=400)
+            return
 
-        video_id = data.get("video_id") or data.get("videoId")
-        if not video_id or video_id == "N/A":
+        # 인증 없는 엔드포인트이므로 값은 신뢰하지 않는다: video_id 형식 검증,
+        # url/썸네일은 video_id로 직접 만들고, 글자 값은 길이 제한 (저장형 XSS 방지).
+        video_id = str(data.get("video_id") or data.get("videoId") or "").strip()
+        if not _VIDEO_ID_RE.fullmatch(video_id):
             self.send_json({"error": "video_id required"}, status=400)
             return
 
@@ -525,17 +549,18 @@ class YouTubeMonitoringHandler(BaseHTTPRequestHandler):
             self.send_json({"status": "skipped", "reason": "duplicate"})
             return
 
-        url = data.get("url", f"https://www.youtube.com/watch?v={video_id}")
-        if "/shorts/" in url or data.get("duration") == "Shorts":
+        client_url = str(data.get("url") or "")
+        if "/shorts/" in client_url or data.get("duration") == "Shorts":
             self.send_json({"status": "skipped", "reason": "shorts"})
             return
+        duration = str(data.get("duration") or "")
         video_data = {
             "video_id": video_id,
-            "title": data.get("title", "N/A"),
-            "channel": data.get("channel", "N/A"),
-            "thumbnail": data.get("thumbnail", "") or f"https://img.youtube.com/vi/{video_id}/0.jpg",
-            "url": url,
-            "duration": data.get("duration", "N/A"),
+            "title": _clean_text(data.get("title")),
+            "channel": _clean_text(data.get("channel")),
+            "thumbnail": f"https://img.youtube.com/vi/{video_id}/0.jpg",
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "duration": duration if _DURATION_RE.fullmatch(duration) else "N/A",
         }
         if not on_video_change(video_data):
             self.send_json({"status": "skipped", "reason": "duplicate"})
@@ -876,20 +901,20 @@ def _get_ui_html() -> str:
             content.innerHTML = dates.map(date => {
                 const entries = historyData.by_date[date] || [];
                 return `
-                    <div class="date-group" data-date="${date}">
+                    <div class="date-group" data-date="${escapeHtml(date)}">
                         <div class="date-header">
-                            <span class="date">${date}</span>
+                            <span class="date">${escapeHtml(date)}</span>
                             <span class="count">${entries.length}개</span>
                             <span class="chevron">▼</span>
                         </div>
                         <div class="date-content">
                             ${entries.map(v => `
-                                <a href="${v.url}" target="_blank" class="video" style="text-decoration:none;color:inherit;">
-                                    <img src="${v.thumbnail || ''}" alt="">
+                                <a href="${safeUrl(v.url)}" target="_blank" rel="noopener noreferrer" class="video" style="text-decoration:none;color:inherit;">
+                                    <img src="${safeUrl(v.thumbnail, '')}" alt="">
                                     <div class="info">
                                         <div class="title">${escapeHtml(v.title)}</div>
                                         <div class="channel">${escapeHtml(v.channel)}</div>
-                                        <div class="meta">${v.duration} · ${formatTime(v.timestamp)}</div>
+                                        <div class="meta">${escapeHtml(v.duration)} · ${formatTime(v.timestamp)}</div>
                                     </div>
                                 </a>
                             `).join('')}
@@ -930,7 +955,7 @@ def _get_ui_html() -> str:
             selectEl.innerHTML = months.map(m => {
                 const [y, mo] = m.split('-');
                 const label = y + '년 ' + parseInt(mo, 10) + '월';
-                return '<option value="' + m + '">' + label + '</option>';
+                return '<option value="' + escapeHtml(m) + '">' + escapeHtml(label) + '</option>';
             }).join('');
 
             const selectedMonth = selectEl.value || months[0];
@@ -981,9 +1006,9 @@ def _get_ui_html() -> str:
                     const entries = byDate[dateKey] || [];
                     if (!dayDetailEl) return;
                     dayDetailEl.style.display = 'block';
-                    dayDetailEl.innerHTML = '<h4>' + dateKey + ' · ' + entries.length + '개</h4>' +
+                    dayDetailEl.innerHTML = '<h4>' + escapeHtml(dateKey) + ' · ' + entries.length + '개</h4>' +
                         entries.map(v => `
-                            <a href="${v.url}" target="_blank" class="video" style="text-decoration:none;color:inherit;display:block;margin-bottom:8px;">
+                            <a href="${safeUrl(v.url)}" target="_blank" rel="noopener noreferrer" class="video" style="text-decoration:none;color:inherit;display:block;margin-bottom:8px;">
                                 <div class="info">
                                     <div class="title">${escapeHtml(v.title)}</div>
                                     <div class="channel">${escapeHtml(v.channel)}</div>
@@ -1022,13 +1047,13 @@ def _get_ui_html() -> str:
                 </div>
                 <div class="channel-list" style="display:grid; gap:8px; text-align:left;">
                     ${channels.map(c => {
-                        const url = c.channel_url || '#';
-                        const thumb = c.thumbnail || '';
+                        const url = safeUrl(c.channel_url);
+                        const thumb = safeUrl(c.thumbnail, '');
                         const name = escapeHtml(c.channel_name || '');
                         const handle = c.handle ? escapeHtml(c.handle) : '';
                         const subs = c.subscriber_count_text ? escapeHtml(c.subscriber_count_text) : '';
                         const meta = [handle, subs].filter(Boolean).join(' · ');
-                        const desc = c.description_snippet ? escapeHtml(c.description_snippet).substring(0, 80) : '';
+                        const desc = c.description_snippet ? escapeHtml(String(c.description_snippet).substring(0, 80)) : '';
                         return `
                         <a href="${url}" target="_blank" class="video channel-item" style="text-decoration:none; color:inherit; cursor:pointer;">
                             <img src="${thumb}" alt="" style="width:56px; height:56px; object-fit:cover; border-radius:50%; flex-shrink:0;">
@@ -1057,7 +1082,7 @@ def _get_ui_html() -> str:
                 return `
                 <div class="date-group" style="margin-bottom:20px;">
                     <div class="date-header">
-                        <span class="date">${month}</span>
+                        <span class="date">${escapeHtml(month)}</span>
                         <span class="count">+${added.length} / -${removed.length}</span>
                         <span class="chevron">▼</span>
                     </div>
@@ -1134,21 +1159,27 @@ def _get_ui_html() -> str:
                 return;
             }
             el.innerHTML = videos.map(v => `
-                <a href="${v.url || '#'}" target="_blank" class="video" style="text-decoration:none; color:inherit; display:block; margin-bottom:12px;">
-                    <img src="${v.thumbnail || ''}" alt="">
+                <a href="${safeUrl(v.url)}" target="_blank" rel="noopener noreferrer" class="video" style="text-decoration:none; color:inherit; display:block; margin-bottom:12px;">
+                    <img src="${safeUrl(v.thumbnail, '')}" alt="">
                     <div class="info">
                         <div class="title">${escapeHtml(v.title)}</div>
                         <div class="channel">${escapeHtml(v.channel)}</div>
-                        <div class="meta">${v.duration || ''}</div>
+                        <div class="meta">${escapeHtml(v.duration)}</div>
                     </div>
                 </a>
             `).join('');
         }
 
+        // 텍스트/속성 모두에 안전하도록 따옴표까지 이스케이프
+        const _HTML_ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
         function escapeHtml(s) {
-            const d = document.createElement('div');
-            d.textContent = s || '';
-            return d.innerHTML;
+            return String(s == null ? '' : s).replace(/[&<>"']/g, ch => _HTML_ESC[ch]);
+        }
+
+        // http(s) URL만 허용 (javascript: 등 차단), 속성용으로 이스케이프
+        function safeUrl(u, fallback = '#') {
+            const s = String(u || '').trim();
+            return /^https?:[/][/]/i.test(s) ? escapeHtml(s) : fallback;
         }
 
         function formatTime(iso) {
