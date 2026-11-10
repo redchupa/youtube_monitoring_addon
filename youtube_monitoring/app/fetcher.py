@@ -98,6 +98,7 @@ class YouTubeHistoryFetcher:
         self.recommended_data: list[dict[str, Any]] | None = None  # 최대 3개 추천 영상
         # 계정의 모든 채널(본채널 + 브랜드 채널) 수집
         self.scan_all_channels = True
+        self._thumb_cache: dict[str, str] = {}
         self._channels: list[dict[str, Any]] | None = None
         self._channels_at = 0.0
         self._client_version = DEFAULT_CLIENT_VERSION
@@ -151,17 +152,24 @@ class YouTubeHistoryFetcher:
         return self.cookies.rotate(force=force)
 
     def _get_best_thumbnail(self, video_id: str) -> str:
-        """maxresdefault 있으면 사용, 없으면 0.jpg."""
+        """maxresdefault 있으면 사용, 없으면 0.jpg. 결과는 캐시 (매 주기 같은 영상을 다시 확인하지 않음)."""
         if not video_id or video_id == "N/A":
             return ""
+        cached = self._thumb_cache.get(video_id)
+        if cached:
+            return cached
         url_base = f"https://img.youtube.com/vi/{video_id}"
+        result = f"{url_base}/0.jpg"
         try:
-            r = requests.get(f"{url_base}/maxresdefault.jpg", timeout=3)
+            r = requests.head(f"{url_base}/maxresdefault.jpg", timeout=3, allow_redirects=True)
             if r.status_code == 200:
-                return f"{url_base}/maxresdefault.jpg"
+                result = f"{url_base}/maxresdefault.jpg"
         except requests.exceptions.RequestException:
-            pass
-        return f"{url_base}/0.jpg"
+            return result  # 네트워크 오류는 캐시하지 않음
+        if len(self._thumb_cache) >= 5000:
+            self._thumb_cache.clear()
+        self._thumb_cache[video_id] = result
+        return result
 
     def _extract_lockup_info(self, lockup: dict) -> dict[str, Any] | None:
         """
@@ -499,6 +507,9 @@ class YouTubeHistoryFetcher:
                     break
             else:
                 for item in path:
+                    # 필요한 개수만 추출 (항목마다 썸네일 확인 요청이 나가므로 긴 페이지 전체를 처리하지 않음)
+                    if len(lockups) + len(video_renderers) >= MAX_HISTORY_ITEMS:
+                        break
                     if not isinstance(item, dict):
                         continue
                     if "lockupViewModel" in item:

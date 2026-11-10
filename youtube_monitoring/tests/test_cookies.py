@@ -412,6 +412,18 @@ class MultiChannelTest(CookieTestBase):
         self.assertEqual([v["video_id"] for v in merged], ["mainAAAAAA1", "brandBBBBB1", "mainAAAAAA2"])
         self.assertEqual(sorted(f.history_by_channel), ["999", "main"])
 
+    def test_thumbnail_cached_and_extraction_capped(self) -> None:
+        self.write_cookies()
+        f = YouTubeHistoryFetcher(self.path)
+        ids = [f"vid{i:08d}" for i in range(60)]
+        with mock.patch("app.fetcher.requests.head", return_value=FakeResponse(404)) as head:
+            items = f._parse_history_data(self.hist(*ids))
+            self.assertEqual(len(items), 20)  # 긴 페이지라도 20개만 처리
+            self.assertEqual(head.call_count, 20)
+            f._parse_history_data(self.hist(*ids))  # 다음 주기: 캐시 사용
+            self.assertEqual(head.call_count, 20)
+        self.assertTrue(items[0]["thumbnail"].endswith("/0.jpg"))
+
     def test_single_channel_or_disabled_uses_default(self) -> None:
         self.write_cookies()
         f = YouTubeHistoryFetcher(self.path)
